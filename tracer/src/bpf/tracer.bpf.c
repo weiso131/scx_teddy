@@ -10,7 +10,7 @@
 char _license[] SEC("license") = "GPL";
 
 // Configuration variables (set by userspace)
-int trace_mode = MODE_TID;        // Tracing mode: TID/TGID
+int target_mode = MODE_TID;        // Tracing mode: TID/TGID
 int target_single_tid = 0;        // TID mode: single target (optimization, 0=use map)
 int target_single_tgid = 0;       // TGID mode: single target (optimization, 0=use map)
 
@@ -50,7 +50,7 @@ static inline bool is_target(struct task_struct *task)
     int tid = task->pid;
     int tgid = task->tgid;
 
-    switch (trace_mode) {
+    switch (target_mode) {
     case MODE_TID:
         // Optimization: direct comparison for single TID
         if (target_single_tid)

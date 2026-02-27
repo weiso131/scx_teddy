@@ -17,15 +17,12 @@ use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore;
 use libbpf_rs::MapFlags;
 
-mod tracer {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/bpf/tracer.skel.rs"
-    ));
+mod bpf_skel {
+    include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"));
 }
 
 #[allow(clippy::wildcard_imports)]
-use tracer::*;
+use bpf_skel::*;
 
 // Trace modes
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -232,14 +229,14 @@ fn main() -> Result<()> {
     };
 
     // Build and load eBPF skeleton
-    let skel_builder = TracerSkelBuilder::default();
+    let skel_builder = BpfSkelBuilder::default();
     let mut open_object = MaybeUninit::uninit();
     let open_skel = skel_builder.open(&mut open_object).context("Failed to open BPF object")?;
     let mut skel = open_skel.load().context("Failed to load BPF object")?;
 
     // Set trace mode
     if let Some(bss) = skel.maps.bss_data.as_deref_mut() {
-        bss.trace_mode = mode as i32;
+        bss.target_mode = mode as i32;
     }
 
     // Get target list
