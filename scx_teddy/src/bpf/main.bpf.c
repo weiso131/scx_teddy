@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* scx_teddy - A BPF scheduler based on task runtime characteristics */
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
 
 #include <scx/common.bpf.h>
 #include <scx/compat.bpf.h>
@@ -10,13 +12,20 @@ char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
 struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, int);
+    __type(value, target_ctx_t);
+} target_tids SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, int);
     __type(value, target_ctx_t);
 } task_ctx SEC(".maps");
 
-s32 target_mode = MODE_TGID;
+s32 target_mode = 0;
 s32 target_single_tid = 0;
 s32 target_single_tgid = 0;
 
@@ -32,10 +41,13 @@ target_ctx_t *get_target_storage(struct task_struct *p)
                                BPF_LOCAL_STORAGE_GET_F_CREATE);
         if (unlikely(!target_ctx))
             return NULL;
-        // Todo: init ctx
-        target_ctx->slice = NORMAL_TASK_SLICE;
-        target_ctx->prio = TIER_NORMAL;
-        target_ctx->on_ecore = 1;
+        s32 key = p->pid;
+        target_ctx_t *tmp = bpf_map_lookup_elem(&target_tids, &key);
+        if (!tmp)
+            return NULL;
+        target_ctx->slice = tmp->slice;
+        target_ctx->prio = tmp->prio;
+        target_ctx->on_ecore = tmp->on_ecore;
     }
 
     return target_ctx;
@@ -69,7 +81,7 @@ static __always_inline s32 dispatch_sync_cold(struct task_struct *p, u64 wake_fl
     target_ctx_t *target_ctx = get_target_storage(p);
     if (!target_ctx)
         return -1;
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, target_ctx->slice, wake_flags);
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)cpu, target_ctx->slice, wake_flags);
     return (s32)cpu;
 }
 
@@ -80,7 +92,6 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
         scx_bpf_dsq_insert(p, NORMAL_TASK_DSQ, NORMAL_TASK_SLICE, wake_flags);
         return prev_cpu;
     }
-        
     // p is woken by this cpu
     if (wake_flags & SCX_WAKE_SYNC) {
         s32 sync_cpu = dispatch_sync_cold(p, wake_flags);
@@ -94,7 +105,7 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
         target_ctx_t *target_ctx = get_target_storage(p);
         if (!target_ctx)
             return prev_cpu;
-        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, target_ctx->slice, wake_flags);
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)cpu, target_ctx->slice, wake_flags);
         return cpu;
     }
 
@@ -116,7 +127,6 @@ void BPF_STRUCT_OPS(teddy_enqueue, struct task_struct *p, u64 enq_flags)
 
         // Todo: use cpu mask find TIER_TARGET_NORMAL and preempt
 
-        return;
     }
 
     scx_bpf_dsq_insert(p, TARGET_CRITICAL_DSQ + target_ctx->prio, target_ctx->slice, enq_flags);

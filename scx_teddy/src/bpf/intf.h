@@ -22,7 +22,7 @@ typedef signed long s64;
 #define TARGET_INTERACTIVE_DSQ 202
 #define TARGET_NORMAL_DSQ 203
 
-#define DSQ_NUM 5
+#define DSQ_NUM 4
 
 #define NORMAL_TASK_SLICE 100 * 1000
 
