@@ -124,17 +124,22 @@ void BPF_STRUCT_OPS(teddy_enqueue, struct task_struct *p, u64 enq_flags)
         return;
     if ((enq_flags & SCX_ENQ_WAKEUP) && target_ctx->prio != TIER_NORMAL) {
         // Todo: use cpu mask find NORMAL_TASK (not target) and preempt
-
         // Todo: use cpu mask find TIER_TARGET_NORMAL and preempt
 
+        scx_bpf_dsq_insert(p, CRITICAL_WAKEUP_DSQ + target_ctx->prio, target_ctx->slice, enq_flags);
+        return;
     }
 
     scx_bpf_dsq_insert(p, TARGET_CRITICAL_DSQ + target_ctx->prio, target_ctx->slice, enq_flags);
 }
 
-void BPF_STRUCT_OPS(teddy_dispatch, s32 raw_cpu, struct task_struct *prev)
+void BPF_STRUCT_OPS(teddy_dispatch, s32 cpu, struct task_struct *prev)
 {
-    if (scx_bpf_dsq_move_to_local(TARGET_CRITICAL_DSQ))
+    if (scx_bpf_dsq_move_to_local(CRITICAL_WAKEUP_DSQ))
+        return;
+    else if (scx_bpf_dsq_move_to_local(INTERACTIVE_WAKEUP_DSQ))
+        return;
+    else if (scx_bpf_dsq_move_to_local(TARGET_CRITICAL_DSQ))
         return;
     else if (scx_bpf_dsq_move_to_local(TARGET_INTERACTIVE_DSQ))
         return;
