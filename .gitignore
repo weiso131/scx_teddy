@@ -2,3 +2,4 @@
 *.lock
 *.skel.rs
 target
+*.json
