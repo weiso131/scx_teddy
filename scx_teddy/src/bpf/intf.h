@@ -36,7 +36,8 @@ typedef signed long s64;
 typedef struct target_ctx {
     s32 prio; // 0, 1, 2
     u64 slice; // ns
-    u8 on_ecore;
+    u8 config;
+    /* | 7 bits NOP | 1 bits ecore |*/
     u64 runtime_ns;
     u64 start_running;
     u64 sleep_start;
@@ -45,6 +46,7 @@ typedef struct target_ctx {
 
 typedef struct task_event {
     int tid;  // Thread ID (statistics are per-TID)
+    int parent;
     unsigned long long sleep_start;
     unsigned long long sleep_end;
     unsigned long long runtime_ns;

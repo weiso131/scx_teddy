@@ -77,10 +77,11 @@ struct TaskStats {
     sleep_interval_count: u64,
 
     event_count: u64,
+    parent: i32,
 }
 
 impl TaskStats {
-    fn new() -> Self {
+    fn new(parent: i32) -> Self {
         Self {
             runtime_sum: 0,
             runtime_sum_sq: 0.0,
@@ -101,6 +102,7 @@ impl TaskStats {
             sleep_interval_count: 0,
 
             event_count: 0,
+            parent,
         }
     }
 
@@ -135,8 +137,10 @@ impl TaskStats {
     }
 }
 
+#[repr(C)]
 struct TaskEvent {
     tid: i32,
+    parent: i32,
     sleep_start: u64,
     sleep_end: u64,
     runtime_ns: u64
@@ -156,7 +160,7 @@ fn process_event(data: &[u8], stats: &Arc<Mutex<std::collections::HashMap<i32, T
 
     // Update statistics
     let mut stats = stats.lock().unwrap();
-    let task_stats = stats.entry(event.tid).or_insert_with(TaskStats::new);
+    let task_stats = stats.entry(event.tid).or_insert(TaskStats::new(event.parent));
     task_stats.update(event.runtime_ns, sleep_duration, event.sleep_end);
 
     0
@@ -219,7 +223,7 @@ fn main() -> Result<()> {
             scheduler_config.update(&key, &val, MapFlags::ANY)?;
             let mut stats_map = stats.lock().unwrap();
             for (&tid, task_stats) in stats_map.iter() {
-                println!("TID: {}, Event cnt: {}", tid, task_stats.event_count);
+                println!("TID: {}, Event cnt: {}, parent: {}, runtime: {}", tid, task_stats.event_count, task_stats.parent, task_stats.runtime_sum);
             }
             stats_map.clear();
             start_time = Instant::now();

@@ -36,7 +36,7 @@ s32 target_single_tgid = 0;
 
 u64 normal_task_cpu = 0;
 
-static void data_to_user(int tid, target_ctx_t *target_ctx)
+static void data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
 {
     u32 key = CONFIG_STOP_RINGBUF;
     u32 *stop_ringbuf = bpf_map_lookup_elem(&scheduler_config, &key);
@@ -49,7 +49,8 @@ static void data_to_user(int tid, target_ctx_t *target_ctx)
         return; // Ring buffer full, drop event
 
     // Fill event data
-    e->tid = tid;
+    e->tid = p->pid;
+    e->parent = p->real_parent->pid;
     e->sleep_start = target_ctx->sleep_start;
     e->sleep_end = target_ctx->sleep_end;
     e->runtime_ns = target_ctx->runtime_ns;
@@ -76,7 +77,7 @@ static target_ctx_t *get_target_storage(struct task_struct *p)
         s32 key = p->pid;
         target_ctx->slice = DEFAULT_SLICE;
         target_ctx->prio = TIER_OTHER;
-        target_ctx->on_ecore = 1;
+        target_ctx->config = 1;
 
         target_ctx->start_running = target_ctx->sleep_start = target_ctx->sleep_end = target_ctx->runtime_ns = 0;
     }
@@ -218,10 +219,10 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
 
     if (!runnable) {
         if (target_ctx->sleep_start != 0)
-            data_to_user(p->pid, target_ctx);
+            data_to_user(p, target_ctx);
         target_ctx->sleep_start = now;
     } else if (target_ctx->runtime_ns >= 1000000000)
-        data_to_user(p->pid, target_ctx);
+        data_to_user(p, target_ctx);
 }
 
 
