@@ -12,6 +12,7 @@ libbpf-rs = "0.26"
 scx_utils = { git = "https://github.com/sched-ext/scx", branch = "main" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+plain = "0.2"
 
 [build-dependencies]
 scx_cargo = { git = "https://github.com/sched-ext/scx", branch = "main" }

@@ -1,4 +1,3 @@
 [workspace]
-members = ["scx_teddy", "tracer"]
+members = ["scx_teddy"]
 resolver = "2"
-

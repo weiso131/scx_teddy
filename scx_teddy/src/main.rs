@@ -4,14 +4,14 @@
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::fs;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use plain::Plain;
 
 use libbpf_rs::skel::OpenSkel;
-use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore;
 use libbpf_rs::MapFlags;
@@ -21,7 +21,6 @@ mod bpf_skel {
 }
 
 mod bpf_intf {
-    #[allow(dead_code)]
     include!(concat!(env!("OUT_DIR"), "/intf.rs"));
 }
 
@@ -48,27 +47,124 @@ struct Config {
 #[command(about = "scx_teddy - A BPF scheduler based on task runtime characteristics", long_about = None)]
 struct Args {
     /// Verbose output
-    #[arg(short, long)]
+    #[arg(short, long, default_value_t = false)]
     verbose: bool,
+    #[arg(short, long, default_value_t = 600)]
+    collect_duration: u64,
+}
 
-    /// Path to JSON configuration file
-    #[arg(short, long)]
-    config: String,
+#[derive(Debug, Clone, Default)]
+struct TaskStats {
+    // Runtime statistics
+    runtime_sum: u64,
+    runtime_sum_sq: f64,  // Sum of squares for variance calculation
+    runtime_min: u64,
+    runtime_max: u64,
+
+    // Sleep statistics
+    sleep_sum: u64,
+    sleep_sum_sq: f64,
+    sleep_min: u64,
+    sleep_max: u64,
+    sleep_count: u64,  // Number of events with sleep
+
+    // Sleep interval statistics (time between sleeps)
+    last_sleep_end: u64,
+    sleep_interval_sum: u64,
+    sleep_interval_sum_sq: f64,
+    sleep_interval_min: u64,
+    sleep_interval_max: u64,
+    sleep_interval_count: u64,
+
+    event_count: u64,
+}
+
+impl TaskStats {
+    fn new() -> Self {
+        Self {
+            runtime_sum: 0,
+            runtime_sum_sq: 0.0,
+            runtime_min: u64::MAX,
+            runtime_max: 0,
+
+            sleep_sum: 0,
+            sleep_sum_sq: 0.0,
+            sleep_min: u64::MAX,
+            sleep_max: 0,
+            sleep_count: 0,
+
+            last_sleep_end: 0,
+            sleep_interval_sum: 0,
+            sleep_interval_sum_sq: 0.0,
+            sleep_interval_min: u64::MAX,
+            sleep_interval_max: 0,
+            sleep_interval_count: 0,
+
+            event_count: 0,
+        }
+    }
+
+    fn update(&mut self, runtime_ns: u64, sleep_ns: u64, sleep_end: u64) {
+        self.event_count += 1;
+
+        // Update runtime statistics
+        self.runtime_sum += runtime_ns;
+        self.runtime_sum_sq += (runtime_ns as f64) * (runtime_ns as f64);
+        self.runtime_min = self.runtime_min.min(runtime_ns);
+        self.runtime_max = self.runtime_max.max(runtime_ns);
+
+        // Update sleep statistics
+        if sleep_ns > 0 {
+            self.sleep_count += 1;
+            self.sleep_sum += sleep_ns;
+            self.sleep_sum_sq += (sleep_ns as f64) * (sleep_ns as f64);
+            self.sleep_min = self.sleep_min.min(sleep_ns);
+            self.sleep_max = self.sleep_max.max(sleep_ns);
+
+            // Update sleep interval statistics
+            if self.last_sleep_end > 0 && sleep_end > self.last_sleep_end {
+                let interval = sleep_end - self.last_sleep_end;
+                self.sleep_interval_count += 1;
+                self.sleep_interval_sum += interval;
+                self.sleep_interval_sum_sq += (interval as f64) * (interval as f64);
+                self.sleep_interval_min = self.sleep_interval_min.min(interval);
+                self.sleep_interval_max = self.sleep_interval_max.max(interval);
+            }
+            self.last_sleep_end = sleep_end;
+        }
+    }
+}
+
+struct TaskEvent {
+    tid: i32,
+    sleep_start: u64,
+    sleep_end: u64,
+    runtime_ns: u64
+}
+
+unsafe impl Plain for TaskEvent {}
+
+// Process event received from ring buffer
+fn process_event(data: &[u8], stats: &Arc<Mutex<std::collections::HashMap<i32, TaskStats>>>) -> i32 {
+    let event = plain::from_bytes::<TaskEvent>(data).unwrap();
+
+    let sleep_duration = if event.sleep_end > event.sleep_start {
+        event.sleep_end - event.sleep_start
+    } else {
+        0
+    };
+
+    // Update statistics
+    let mut stats = stats.lock().unwrap();
+    let task_stats = stats.entry(event.tid).or_insert_with(TaskStats::new);
+    task_stats.update(event.runtime_ns, sleep_duration, event.sleep_end);
+
+    0
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-
     println!("scx_teddy scheduler starting...");
-
-    // Load configuration from JSON file
-    let config_content = fs::read_to_string(&args.config)
-        .context(format!("Failed to read config file: {}", args.config))?;
-    let config: Config = serde_json::from_str(&config_content)
-        .context("Failed to parse JSON config")?;
-
-    println!("Loaded config: target_mode={}, tgid={:?}, tasks count={}",
-             config.target_mode, config.tgid, config.tasks.len());
 
     // Build and load eBPF skeleton
     let skel_builder = BpfSkelBuilder::default();
@@ -78,52 +174,7 @@ fn main() -> Result<()> {
     // Initialize SCX enums from kernel BTF (SCX_DSQ_LOCAL_ON, etc.)
     scx_utils::import_enums!(open_skel);
 
-    // Configure BPF based on config file
-    if let Some(bss) = open_skel.maps.bss_data.as_mut() {
-        bss.target_mode = config.target_mode;
-
-        // Set target_single_tgid if tgid is provided
-        if let Some(tgid) = config.tgid {
-            bss.target_single_tgid = tgid;
-            println!("Set target_single_tgid to {}", tgid);
-        }
-
-        // Set target_single_tid to the first task's tid if available
-        if let Some(first_task) = config.tasks.first() {
-            bss.target_single_tid = first_task.tid;
-        }
-    }
-
     let mut skel = open_skel.load().context("Failed to load BPF object")?;
-
-    // Update target_tids map with all tasks from config
-    let target_tids = skel.maps.target_tids;
-
-    for task in &config.tasks {
-        let key = task.tid;
-        let val = bpf_intf::target_ctx_t {
-            prio: task.prio,
-            slice: task.slice,
-            on_ecore: task.on_ecore,
-        };
-
-        let key_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &key as *const _ as *const u8,
-                std::mem::size_of_val(&key),
-            )
-        };
-        let val_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &val as *const _ as *const u8,
-                std::mem::size_of_val(&val),
-            )
-        };
-
-        target_tids.update(key_bytes, val_bytes, MapFlags::ANY)?;
-        println!("Configured task: tid={}, prio={}, slice={}, on_ecore={}",
-                 task.tid, task.prio, task.slice, task.on_ecore);
-    }
 
     // Load and attach the scheduler struct_ops
     let _struct_ops = skel
@@ -131,6 +182,19 @@ fn main() -> Result<()> {
         .teddy_ops
         .attach_struct_ops()
         .context("Failed to attach struct_ops")?;
+
+    // Statistics storage
+    let stats: Arc<Mutex<std::collections::HashMap<i32, TaskStats>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let stats_clone = Arc::clone(&stats);
+
+    let mut builder = libbpf_rs::RingBufferBuilder::new();
+    builder
+        .add(&skel.maps.events, move |data| process_event(data, &stats_clone))
+        .context("Failed to add ringbuf")?;
+    let ringbuf = builder.build().context("Failed to build ringbuf")?;
+
+    let scheduler_config = &skel.maps.scheduler_config;
 
     println!("scx_teddy scheduler loaded successfully!");
     println!("Press Ctrl+C to exit...\n");
@@ -144,13 +208,25 @@ fn main() -> Result<()> {
     })
     .expect("Error setting Ctrl+C handler");
 
+    let mut start_time = Instant::now();
+    let duration = Duration::from_secs(args.collect_duration);
+
     // Main loop - keep scheduler running
     while *running.lock().unwrap() {
-        std::thread::sleep(Duration::from_millis(1000));
-
-        if args.verbose {
-            println!("Scheduler running...");
+        if start_time.elapsed() >= duration {
+            let key = 0u32.to_ne_bytes();
+            let mut val = 1u32.to_ne_bytes();
+            scheduler_config.update(&key, &val, MapFlags::ANY)?;
+            let mut stats_map = stats.lock().unwrap();
+            for (&tid, task_stats) in stats_map.iter() {
+                println!("TID: {}, Event cnt: {}", tid, task_stats.event_count);
+            }
+            stats_map.clear();
+            start_time = Instant::now();
+            val = 0u32.to_ne_bytes();
+            scheduler_config.update(&key, &val, MapFlags::ANY)?;
         }
+        ringbuf.poll(Duration::from_millis(1000))?;
     }
 
     println!("scx_teddy scheduler exiting...");

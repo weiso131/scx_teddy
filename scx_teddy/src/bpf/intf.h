@@ -17,23 +17,37 @@ typedef signed long s64;
 #define MODE_TID    0  
 #define MODE_TGID   1
 
-#define NORMAL_TASK_DSQ 200
-#define TARGET_CRITICAL_DSQ 201
-#define TARGET_INTERACTIVE_DSQ 202
-#define TARGET_NORMAL_DSQ 203
+#define OTHER_DSQ 200
+#define CRITICAL_DSQ 201
+#define INTERACTIVE_DSQ 202
+#define NORMAL_DSQ 203
 #define CRITICAL_WAKEUP_DSQ 204
 #define INTERACTIVE_WAKEUP_DSQ 205
 
 #define DSQ_NUM 6
 
-#define NORMAL_TASK_SLICE 100 * 1000
+#define DEFAULT_SLICE 100 * 1000
 
 #define TIER_CRITICAL 0
 #define TIER_INTERACTIVE 1
 #define TIER_NORMAL 2
+#define TIER_OTHER 3
 
 typedef struct target_ctx {
     s32 prio; // 0, 1, 2
     u64 slice; // ns
     u8 on_ecore;
+    u64 runtime_ns;
+    u64 start_running;
+    u64 sleep_start;
+    u64 sleep_end;
 } target_ctx_t;
+
+typedef struct task_event {
+    int tid;  // Thread ID (statistics are per-TID)
+    unsigned long long sleep_start;
+    unsigned long long sleep_end;
+    unsigned long long runtime_ns;
+} task_event_t;
+
+#define CONFIG_STOP_RINGBUF 0
