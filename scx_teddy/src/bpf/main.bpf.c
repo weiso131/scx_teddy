@@ -12,13 +12,6 @@ char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, int);
-    __type(value, target_ctx_t);
-} target_tids SEC(".maps");
-
-struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, int);
@@ -81,12 +74,9 @@ static target_ctx_t *get_target_storage(struct task_struct *p)
         if (unlikely(!target_ctx))
             return NULL;
         s32 key = p->pid;
-        target_ctx_t *tmp = bpf_map_lookup_elem(&target_tids, &key);
-        if (!tmp)
-            return NULL;
-        target_ctx->slice = tmp->slice;
-        target_ctx->prio = tmp->prio;
-        target_ctx->on_ecore = tmp->on_ecore;
+        target_ctx->slice = DEFAULT_SLICE;
+        target_ctx->prio = TIER_OTHER;
+        target_ctx->on_ecore = 1;
 
         target_ctx->start_running = target_ctx->sleep_start = target_ctx->sleep_end = target_ctx->runtime_ns = 0;
     }
