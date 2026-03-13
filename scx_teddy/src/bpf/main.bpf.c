@@ -225,6 +225,29 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
         data_to_user(p, target_ctx);
 }
 
+void BPF_STRUCT_OPS(teddy_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
+{
+    u32 key = CONFIG_STOP_RINGBUF;
+    u32 *stop_ringbuf = bpf_map_lookup_elem(&scheduler_config, &key);
+
+    if (*stop_ringbuf)
+        goto clear_tracing_data;
+
+    task_event_t *e = bpf_ringbuf_reserve(&events, sizeof(task_event_t), 0);
+    if (!e)
+        return;
+
+    e->tid = p->pid;
+    e->parent = -1;
+    e->sleep_start = 0;
+    e->sleep_end = 0;
+    e->runtime_ns = 0;
+
+submit_ringbuf:
+    // Submit to ring buffer
+    bpf_ringbuf_submit(e, 0);
+clear_tracing_data:
+}
 
 /* Scheduler exit - record exit info */
 void BPF_STRUCT_OPS(teddy_exit, struct scx_exit_info *ei)
@@ -240,6 +263,7 @@ SCX_OPS_DEFINE(teddy_ops,
                .runnable       = (void *)teddy_runnable,
                .running        = (void *)teddy_running,
                .stopping       = (void *)teddy_stopping,
+               .exit_task      = (void *)teddy_exit_task,
                .init           = (void *)teddy_init,
                .exit           = (void *)teddy_exit,
                .flags          = SCX_OPS_KEEP_BUILTIN_IDLE,

@@ -78,6 +78,7 @@ struct TaskStats {
 
     event_count: u64,
     parent: i32,
+    exit: u8,
 }
 
 impl TaskStats {
@@ -103,6 +104,7 @@ impl TaskStats {
 
             event_count: 0,
             parent,
+            exit: 0,
         }
     }
 
@@ -160,8 +162,15 @@ fn process_event(data: &[u8], stats: &Arc<Mutex<std::collections::HashMap<i32, T
 
     // Update statistics
     let mut stats = stats.lock().unwrap();
-    let task_stats = stats.entry(event.tid).or_insert(TaskStats::new(event.parent));
-    task_stats.update(event.runtime_ns, sleep_duration, event.sleep_end);
+
+    if event.parent > 0 {
+        let task_stats = stats.entry(event.tid).or_insert(TaskStats::new(event.parent));
+        task_stats.update(event.runtime_ns, sleep_duration, event.sleep_end);
+    } else if event.parent == -1 {
+        if let Some(task_stats) = stats.get_mut(&event.tid) {
+            task_stats.exit = 1;
+        }
+    }
 
     0
 }
@@ -223,7 +232,8 @@ fn main() -> Result<()> {
             scheduler_config.update(&key, &val, MapFlags::ANY)?;
             let mut stats_map = stats.lock().unwrap();
             for (&tid, task_stats) in stats_map.iter() {
-                println!("TID: {}, Event cnt: {}, parent: {}, runtime: {}", tid, task_stats.event_count, task_stats.parent, task_stats.runtime_sum);
+                println!("TID: {}, Event cnt: {}, parent: {}, runtime: {}, exit: {}", 
+                tid, task_stats.event_count, task_stats.parent, task_stats.runtime_sum, task_stats.exit);
             }
             stats_map.clear();
             start_time = Instant::now();
