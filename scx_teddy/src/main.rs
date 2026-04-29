@@ -139,6 +139,18 @@ fn load_debug_config(path: &str) -> Result<Vec<String>> {
 
 unsafe impl Plain for TaskEvent {}
 
+fn thread_cpu_time() -> Duration {
+    #[repr(C)]
+    struct Timespec { tv_sec: i64, tv_nsec: i64 }
+    const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+    extern "C" {
+        fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+    }
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts); }
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
 // Process event received from ring buffer
 fn process_event(data: &[u8], stats: &Arc<Mutex<std::collections::HashMap<i32, TaskStats>>>) -> i32 {
     let event = plain::from_bytes::<TaskEvent>(data).unwrap();
@@ -289,7 +301,7 @@ fn main() -> Result<()> {
     let duration = Duration::from_secs(args.collect_duration);
 
     // Main loop - keep scheduler running
-    while *running.lock().unwrap() {
+    while *running.lock().unwrap() && !scx_utils::uei_exited!(&skel, uei) {
         if start_time.elapsed() >= duration {
             let key = 0u32.to_ne_bytes();
             let mut val = 1u32.to_ne_bytes();
@@ -347,6 +359,10 @@ fn main() -> Result<()> {
                 let mut cluster_tids: Vec<Vec<i32>> = vec![Vec::new(); n];
                 let update_map = &skel.maps.update_map;
 
+                let wall_start = Instant::now();
+                let cpu_start = thread_cpu_time();
+                let mut predict_count: usize = 0;
+
                 for (&tid, task_stats) in stats_map.iter() {
                     if task_stats.exit != 0 || task_stats.event_count < args.min_events{
                         continue;
@@ -354,6 +370,7 @@ fn main() -> Result<()> {
                     let named_stats = task_stats.get_named_stats();
                     let features: Vec<f64> = named_stats.iter().map(|(_, v)| *v).collect();
                     let cluster = classifier.predict(&features);
+                    predict_count += 1;
                     cluster_tids[cluster].push(tid);
 
                     let cluster_cfg = cfg.clusters
@@ -372,8 +389,16 @@ fn main() -> Result<()> {
                     update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
                 }
 
+                let batch_wall_us = wall_start.elapsed().as_micros();
+                let batch_cpu_us  = (thread_cpu_time() - cpu_start).as_micros();
+                let avg_per_task_ns = if predict_count > 0 {
+                    (batch_cpu_us * 1000) / predict_count as u128
+                } else { 0 };
+
                 println!("Classification results (updated {} tasks):",
                     cluster_tids.iter().map(|v| v.len()).sum::<usize>());
+                println!("  [timing] batch wall={}us cpu={}us avg={}ns/task over {} tasks (incl. feature build + map update)",
+                    batch_wall_us, batch_cpu_us, avg_per_task_ns, predict_count);
                 for (i, tids) in cluster_tids.iter().enumerate() {
                     let cluster_cfg = cfg.clusters
                         .get(&i.to_string())
@@ -452,6 +477,8 @@ fn main() -> Result<()> {
     }
 
     println!("scx_teddy scheduler exiting...");
+    scx_utils::uei_report!(&skel, uei)
+        .context("UEI report")?;
 
     Ok(())
 }
