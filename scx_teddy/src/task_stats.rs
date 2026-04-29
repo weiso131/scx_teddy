@@ -29,6 +29,9 @@ pub struct TaskStats {
     pub event_count: u64,
     parent: i32,
     pub exit: u8,
+    /// Set to 1 whenever new events arrive; cleared after the task is reclassified.
+    /// Lets the classify loop skip tasks whose features haven't changed since last predict.
+    pub need_update: u8,
 }
 
 impl TaskStats {
@@ -47,10 +50,12 @@ impl TaskStats {
             event_count: 0,
             parent,
             exit: 0,
+            need_update: 0,
         }
     }
 
     pub fn update(&mut self, event: &TaskEvent) {
+        self.need_update = 1;
         self.event_count += event.event_cnt as u64;
 
         // Update runtime statistics
@@ -138,6 +143,19 @@ impl TaskStats {
     /// Returns feature values as a Vec (order matches get_named_stats).
     pub fn get_stats(&self) -> Vec<f64> {
         self.get_named_stats().into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// If `need_update` is set, clear it and return both the feature vector and
+    /// the named stats (named stats are needed by adaptive slice computation).
+    /// Returns None when the task hasn't received new events since last predict.
+    pub fn take_features_if_needed(&mut self) -> Option<(Vec<f64>, Vec<(&'static str, f64)>)> {
+        if self.need_update == 0 {
+            return None;
+        }
+        self.need_update = 0;
+        let named = self.get_named_stats();
+        let features = named.iter().map(|(_, v)| *v).collect();
+        Some((features, named))
     }
 
     /// Returns feature names (order matches get_stats).

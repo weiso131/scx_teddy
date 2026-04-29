@@ -363,12 +363,13 @@ fn main() -> Result<()> {
                 let cpu_start = thread_cpu_time();
                 let mut predict_count: usize = 0;
 
-                for (&tid, task_stats) in stats_map.iter() {
+                for (&tid, task_stats) in stats_map.iter_mut() {
                     if task_stats.exit != 0 || task_stats.event_count < args.min_events{
                         continue;
                     }
-                    let named_stats = task_stats.get_named_stats();
-                    let features: Vec<f64> = named_stats.iter().map(|(_, v)| *v).collect();
+                    let Some((features, named_stats)) = task_stats.take_features_if_needed() else {
+                        continue;
+                    };
                     let cluster = classifier.predict(&features);
                     predict_count += 1;
                     cluster_tids[cluster].push(tid);
