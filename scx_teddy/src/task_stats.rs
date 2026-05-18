@@ -159,10 +159,7 @@ impl TaskStats {
         if self.need_update == 0 {
             return None;
         }
-        if self.update_cool_down != 0 {
-            self.update_cool_down -= 1;
-            return None;
-        }
+        
         self.need_update = 0;
         let named = self.get_named_stats();
         let features = named.iter().map(|(_, v)| *v).collect();

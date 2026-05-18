@@ -393,11 +393,16 @@ fn main() -> Result<()> {
 
                     // Write sched_info_t {prio: s32, slice: u64} to update_map
                     // Layout: 4 bytes prio + 4 bytes padding + 8 bytes slice
-                    let tid_key = tid.to_ne_bytes();
-                    let mut val_buf = [0u8; 16];
-                    val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
-                    val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
-                    update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
+
+                    if task_stats.update_cool_down != 0 {
+                        task_stats.update_cool_down -= 1; 
+                    } else {
+                        let tid_key = tid.to_ne_bytes();
+                        let mut val_buf = [0u8; 16];
+                        val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
+                        val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
+                        update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
+                    }
                 }
 
                 let batch_wall_us = wall_start.elapsed().as_micros();
