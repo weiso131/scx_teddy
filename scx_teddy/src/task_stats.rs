@@ -32,6 +32,10 @@ pub struct TaskStats {
     /// Set to 1 whenever new events arrive; cleared after the task is reclassified.
     /// Lets the classify loop skip tasks whose features haven't changed since last predict.
     pub need_update: u8,
+
+    pub last_cluster: usize,
+    pub stable_cnt: u8,
+    pub update_cool_down: u16,
 }
 
 impl TaskStats {
@@ -51,6 +55,9 @@ impl TaskStats {
             parent,
             exit: 0,
             need_update: 0,
+            last_cluster: usize::MAX,
+            stable_cnt: 0,
+            update_cool_down: 0,
         }
     }
 
@@ -150,6 +157,10 @@ impl TaskStats {
     /// Returns None when the task hasn't received new events since last predict.
     pub fn take_features_if_needed(&mut self) -> Option<(Vec<f64>, Vec<(&'static str, f64)>)> {
         if self.need_update == 0 {
+            return None;
+        }
+        if self.update_cool_down != 0 {
+            self.update_cool_down -= 1;
             return None;
         }
         self.need_update = 0;

@@ -8,6 +8,7 @@ use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
+use std::cmp::max;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -373,6 +374,15 @@ fn main() -> Result<()> {
                     let cluster = classifier.predict(&features);
                     predict_count += 1;
                     cluster_tids[cluster].push(tid);
+                    if task_stats.last_cluster != cluster {
+                        task_stats.last_cluster = cluster;
+                        task_stats.stable_cnt = 0;
+                    } else {
+                        task_stats.stable_cnt = max(task_stats.stable_cnt + 1, 31);
+                        if  task_stats.stable_cnt > 4 {
+                            task_stats.update_cool_down += 1 << (task_stats.stable_cnt - 4);
+                        }
+                    }
 
                     let cluster_cfg = cfg.clusters
                         .get(&cluster.to_string())
