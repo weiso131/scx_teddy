@@ -383,6 +383,10 @@ fn main() -> Result<()> {
                             task_stats.update_cool_down += 1 << (task_stats.stable_cnt - 4);
                         }
                     }
+                    let comm = read_proc_comm(tid);
+                    if comm.contains("schbench-msg") && cluster != 1 {
+                        println!("schbench-msg wrong predict");
+                    }
 
                     let cluster_cfg = cfg.clusters
                         .get(&cluster.to_string())
@@ -410,18 +414,6 @@ fn main() -> Result<()> {
                 let avg_per_task_ns = if predict_count > 0 {
                     (batch_cpu_us * 1000) / predict_count as u128
                 } else { 0 };
-
-                println!("Classification results (updated {} tasks):",
-                    cluster_tids.iter().map(|v| v.len()).sum::<usize>());
-                println!("  [timing] batch wall={}us cpu={}us avg={}ns/task over {} tasks (incl. feature build + map update)",
-                    batch_wall_us, batch_cpu_us, avg_per_task_ns, predict_count);
-                for (i, tids) in cluster_tids.iter().enumerate() {
-                    let cluster_cfg = cfg.clusters
-                        .get(&i.to_string())
-                        .unwrap_or(&cfg.default);
-                    println!("  Cluster {} (prio={}, {} tasks)",
-                        i, cluster_cfg.prio, tids.len());
-                }
             } else {
                 // Collect mode: write stats to CSV
                 // Read existing CSV rows into an ordered map (tid -> row string)
