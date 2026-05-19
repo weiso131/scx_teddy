@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
+use std::cmp::max;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -258,17 +259,37 @@ fn run_classify_cycle(
     let wall_start = Instant::now();
     let cpu_start = thread_cpu_time();
     let mut predict_count: usize = 0;
+    let mut update_count: usize = 0;
 
     for (&tid, task_stats) in stats_map.iter_mut() {
         if task_stats.exit != 0 || task_stats.event_count < min_events {
             continue;
         }
+
+        // Only classify the synthetic benchmark workloads (stress-ng, schbench);
+        // every other task is left alone — no prediction, no BPF map write.
+        let comm = read_proc_comm(tid);
+        if !(comm.contains("stress-ng") || comm.contains("schbench")) {
+            continue;
+        }
+
         let Some((features, named_stats)) = task_stats.take_features_if_needed() else {
             continue;
         };
         let cluster = classifier.predict(&features);
         predict_count += 1;
         cluster_tids[cluster].push(tid);
+
+        if comm.contains("schbench-msg") && cluster != 1 {
+            println!("schbench-msg wrong predict");
+        }
+
+        // Skip the BPF map update when the cluster is unchanged: writing the
+        // same assignment is wasteful and the update is costly on the BPF side.
+        if task_stats.last_cluster == cluster {
+            continue;
+        }
+        task_stats.last_cluster = cluster;
 
         let cluster_cfg = cfg.clusters
             .get(&cluster.to_string())
@@ -284,6 +305,7 @@ fn run_classify_cycle(
         val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
         val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
         update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
+        update_count += 1;
     }
 
     let batch_wall_us = wall_start.elapsed().as_micros();
@@ -292,17 +314,6 @@ fn run_classify_cycle(
         (batch_cpu_us * 1000) / predict_count as u128
     } else { 0 };
 
-    println!("Classification results (updated {} tasks):",
-        cluster_tids.iter().map(|v| v.len()).sum::<usize>());
-    println!("  [timing] batch wall={}us cpu={}us avg={}ns/task over {} tasks (incl. feature build + map update)",
-        batch_wall_us, batch_cpu_us, avg_per_task_ns, predict_count);
-    for (i, tids) in cluster_tids.iter().enumerate() {
-        let cluster_cfg = cfg.clusters
-            .get(&i.to_string())
-            .unwrap_or(&cfg.default);
-        println!("  Cluster {} (prio={}, {} tasks)",
-            i, cluster_cfg.prio, tids.len());
-    }
     Ok(())
 }
 

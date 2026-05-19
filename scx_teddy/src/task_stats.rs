@@ -32,6 +32,9 @@ pub struct TaskStats {
     /// Set to 1 whenever new events arrive; cleared after the task is reclassified.
     /// Lets the classify loop skip tasks whose features haven't changed since last predict.
     pub need_update: u8,
+    /// Cluster assigned by the last prediction, or usize::MAX if never predicted.
+    /// Lets the classify loop skip the BPF map update when the cluster is unchanged.
+    pub last_cluster: usize,
 }
 
 impl TaskStats {
@@ -51,6 +54,7 @@ impl TaskStats {
             parent,
             exit: 0,
             need_update: 0,
+            last_cluster: usize::MAX,
         }
     }
 
