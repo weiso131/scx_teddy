@@ -144,7 +144,7 @@ impl TaskStats {
     }
 
     fn sleep_base_ratio(&self, cnt: u64) -> f64 {
-        if (self.sleep_count == 0) {
+        if self.sleep_count == 0 {
             return 0 as f64;
         }
         (cnt as f64) / (self.sleep_count as f64)
@@ -185,5 +185,128 @@ impl TaskStats {
     /// Returns feature names (order matches get_stats).
     pub fn get_feature_names() -> Vec<&'static str> {
         Self::default().get_named_stats().into_iter().map(|(n, _)| n).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_initial_stats() {
+        let stats = TaskStats::new(1);
+        assert_eq!(stats.event_count, 0);
+        assert_eq!(stats.avg_runtime_ms(), 0.0);
+        assert_eq!(stats.stddev_runtime_ms(), 0.0);
+        assert_eq!(stats.runtime_cv(), 0.0);
+    }
+
+    #[test]
+    fn test_single_event() {
+        let mut stats = TaskStats::new(1);
+        let event = TaskEvent {
+            tid: 100,
+            parent: 1,
+            event_cnt: 1,
+            runtime_sum: 10_000_000,    // 10ms
+            runtime_sq_sum: 100_000_000_000_000, // (10^7)^2
+            sleep_cnt: 0,
+            sleep_sum: 0,
+            sleep_sq_sum: 0,
+            in_iowait_cnt: 0,
+            futex_wait_cnt: 0,
+        };
+        stats.update(&event);
+        
+        assert_eq!(stats.event_count, 1);
+        assert_eq!(stats.avg_runtime_ms(), 10.0);
+        // Stddev for single event should be 0
+        assert_eq!(stats.stddev_runtime_ms(), 0.0);
+    }
+
+    #[test]
+    fn test_multiple_events_calculation() {
+        let mut stats = TaskStats::new(1);
+        
+        // Data: 10ms, 20ms, 30ms
+        // Mean = 20ms
+        // Variance = ((10^2 + 20^2 + 30^2)/3) - 20^2 = (1400/3) - 400 = 466.67 - 400 = 66.67
+        // Stddev = sqrt(66.67) = 8.165
+        
+        let events = vec![
+            10_000_000,
+            20_000_000,
+            30_000_000,
+        ];
+
+        for r in events {
+            stats.update(&TaskEvent {
+                tid: 100,
+                parent: 1,
+                event_cnt: 1,
+                runtime_sum: r,
+                runtime_sq_sum: r * r,
+                sleep_cnt: 0,
+                sleep_sum: 0,
+                sleep_sq_sum: 0,
+                in_iowait_cnt: 0,
+                futex_wait_cnt: 0,
+            });
+        }
+
+        assert_eq!(stats.event_count, 3);
+        assert_eq!(stats.avg_runtime_ms(), 20.0);
+        
+        let stddev = stats.stddev_runtime_ms();
+        assert!((stddev - 8.1649).abs() < 0.001);
+        
+        let cv = stats.runtime_cv();
+        assert!((cv - (8.1649 / 20.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_sleep_stats() {
+        let mut stats = TaskStats::new(1);
+        let event = TaskEvent {
+            tid: 100,
+            parent: 1,
+            event_cnt: 1,
+            runtime_sum: 0,
+            runtime_sq_sum: 0,
+            sleep_cnt: 2,
+            sleep_sum: 5000, // 5ms in total
+            sleep_sq_sum: 12_500_000, // (2.5^2 + 2.5^2) in us? 
+                                      // Wait, the code says sleep_sum is in us (>> 10 approx)
+                                      // Let's re-check the update_event_data in BPF
+            in_iowait_cnt: 0,
+            futex_wait_cnt: 0,
+        };
+        // In BPF: sleep_mus = (target_ctx->sleep_end - target_ctx->sleep_start) >> 10;
+        // target_ctx->sleep_sum += sleep_mus;
+        // In Rust: (self.sleep_sum as f64 / self.sleep_count as f64) / 1_000.0 (to ms)
+        
+        stats.update(&event);
+        assert_eq!(stats.sleep_count, 2);
+        assert_eq!(stats.avg_sleep_ms(), 2.5);
+    }
+
+    #[test]
+    fn test_interface_layout() {
+        // This test prevents out-of-sync issues between C (intf.h) and Rust (task_stats.rs)
+        use crate::bpf_intf::task_event_t;
+        
+        // Ensure the sizes are exactly the same
+        assert_eq!(
+            std::mem::size_of::<TaskEvent>(),
+            std::mem::size_of::<task_event_t>(),
+            "Size of manually defined TaskEvent does not match the C definition in intf.h!"
+        );
+
+        // Ensure the memory alignment is the same
+        assert_eq!(
+            std::mem::align_of::<TaskEvent>(),
+            std::mem::align_of::<task_event_t>(),
+            "Alignment of manually defined TaskEvent does not match the C definition in intf.h!"
+        );
     }
 }
