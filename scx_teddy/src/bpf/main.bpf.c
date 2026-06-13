@@ -55,6 +55,37 @@ static __always_inline u64 dsq_id(s32 prio, u32 kind)
     return DSQ_BASE + (u64)prio * dsq_per_prio() + kind;
 }
 
+/* P-core deadline. The fastest-kind DSQs (kind == FASTEST_KIND) are vtime DSQs,
+ * not FIFO: every task is inserted with vtime = now + this deadline. Once that
+ * deadline passes, an E-core may pull the task instead of letting it keep
+ * waiting behind a P-core hog (e.g. a game busy-waiting that pins the P-cores).
+ * 10 ms for now; the same deadline notion is later meant to feed the cpu_prefer
+ * mechanism. */
+#define P_CORE_DEADLINE_NS (10 * 1000 * 1000ULL)
+
+/* The fastest CPU kind's DSQs are run as vtime DSQs (deadline ordering) so that
+ * stalled P-core tasks can be rescued by E-cores. Every other kind stays FIFO.
+ * Keep this the single source of truth: a DSQ must be inserted into with vtime
+ * IFF this returns true, never mixing FIFO and vtime in the same DSQ. */
+static __always_inline bool kind_is_vtime(u32 kind)
+{
+    return kind == FASTEST_KIND;
+}
+
+/* Insert p into the per-(prio,kind) DSQ, choosing FIFO vs vtime by kind. The
+ * fastest kind goes into its vtime DSQ with a deadline of now + P_CORE_DEADLINE_NS;
+ * all other kinds use plain FIFO insertion. */
+static __always_inline void insert_kind_dsq(struct task_struct *p, s32 prio,
+                                            u32 kind, u64 slice, u64 enq_flags)
+{
+    if (kind_is_vtime(kind)) {
+        u64 vtime = scx_bpf_now() + P_CORE_DEADLINE_NS;
+        scx_bpf_dsq_insert_vtime(p, dsq_id(prio, kind), slice, vtime, enq_flags);
+    } else {
+        scx_bpf_dsq_insert(p, dsq_id(prio, kind), slice, enq_flags);
+    }
+}
+
 #define MIN_SEND_INTERVAL 100000000
 
 struct {
@@ -205,7 +236,7 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
     }
 
     if (target_ctx->prio >= CRITICAL_PRIO) {
-        scx_bpf_dsq_insert(p, dsq_id(target_ctx->prio, target_ctx->kind), DEFAULT_SLICE, wake_flags);
+        insert_kind_dsq(p, target_ctx->prio, target_ctx->kind, DEFAULT_SLICE, wake_flags);
         return prev_cpu;
     }
 
@@ -253,8 +284,8 @@ void BPF_STRUCT_OPS(teddy_enqueue, struct task_struct *p, u64 enq_flags)
         return;
     }
 
-    scx_bpf_dsq_insert(p, dsq_id(target_ctx->prio, target_ctx->kind),
-                       target_ctx->slice, enq_flags);
+    insert_kind_dsq(p, target_ctx->prio, target_ctx->kind,
+                    target_ctx->slice, enq_flags);
 }
 
 void BPF_STRUCT_OPS(teddy_dispatch, s32 cpu, struct task_struct *prev)
@@ -268,6 +299,13 @@ void BPF_STRUCT_OPS(teddy_dispatch, s32 cpu, struct task_struct *prev)
     /* This CPU's kind selects which kind-only DSQ this CPU may pull from. */
     u32 kind = cpu_info[cpu].cpu_kind;
 
+    /* A non-fastest CPU (e.g. an E-core) may also rescue tasks stranded on the
+     * fastest-kind (P-core) vtime DSQ once their deadline has passed — see
+     * P_CORE_DEADLINE_NS. This keeps a P-core hog (a busy-waiting game) from
+     * starving P-core-bound work indefinitely. */
+    bool is_e_core = !kind_is_vtime(kind);
+    u64 now = scx_bpf_now();
+
     /* Walk priorities high -> low. Within each priority, pull the shared
      * (any-kind) DSQ before this CPU's own kind DSQ — "runs anywhere" wins. */
     for (s32 prio = 0; prio < PRIORITY_NUM; prio++) {
@@ -275,6 +313,13 @@ void BPF_STRUCT_OPS(teddy_dispatch, s32 cpu, struct task_struct *prev)
             return;
         if (scx_bpf_dsq_move_to_local(dsq_id(prio, kind)))
             return;
+        if (is_e_core) {
+            struct task_struct *head = scx_bpf_dsq_peek(dsq_id(prio, FASTEST_KIND));
+            if (head && now > head->scx.dsq_vtime) {
+                if (scx_bpf_dsq_move_to_local(dsq_id(prio, FASTEST_KIND)))
+                    return;
+            }
+        }
     }
 }
 
