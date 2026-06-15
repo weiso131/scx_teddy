@@ -106,7 +106,7 @@ impl ClusterSchedConfig {
                         .map(|(_, v)| *v)
                         .unwrap_or(0.0)
                 };
-                let avg_ms = lookup("avg_runtime_ms");
+                let avg_ms = lookup("runtime_ms");
                 let cv = lookup("runtime_cv");
                 let avg_ns = avg_ms * 1_000_000.0;
                 let std_ns = avg_ms * cv * 1_000_000.0;
