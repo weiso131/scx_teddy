@@ -80,14 +80,14 @@ struct SchedConfig {
 /// unknown cluster id falls back to the config's `default` entry; the GUI
 /// validates the model↔config pairing.
 struct SchedSet {
-    model: Box<dyn classifier::Classifier>,
+    model: Box<dyn classifier::Predictor>,
     config: SchedConfig,
 }
 
 /// Load a model + config into a SchedSet. Errors are returned so the caller can
 /// abort (startup) or keep the previous set (live control-file reload).
 fn load_sched_set(model_path: &str, config_path: &str) -> Result<SchedSet> {
-    let model = classifier::load_model(model_path)?;
+    let model = classifier::load_predictor(model_path)?;
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config: {}", config_path))?;
     let config: SchedConfig = serde_json::from_str(&content)
@@ -701,6 +701,9 @@ fn run_classify_cycle(
         (batch_cpu_us * 1000) / predict_count as u128
     } else { 0 };
 
+    log!(logger, "  [timing] batch wall={}us cpu={}us avg={}ns/task over {} tasks",
+        batch_wall_us, batch_cpu_us, avg_per_task_ns, predict_count);
+
     Ok(())
 }
 
@@ -787,8 +790,8 @@ fn main() -> Result<()> {
         let config_path = args.config.as_deref()
             .context("Classify mode requires --config <path>")?;
         let set = load_sched_set(model_path, config_path)?;
-        log!(logger, "Loaded default model {} ({} clusters) + config {}",
-            model_path, set.model.n_clusters(), config_path);
+        log!(logger, "Loaded default model {} ({} outputs) + config {}",
+            model_path, set.model.n_outputs(), config_path);
         Some(set)
     } else {
         None
@@ -804,8 +807,8 @@ fn main() -> Result<()> {
         if let (Some(tm), Some(tc)) = (&args.target_model, &args.target_config) {
             match load_sched_set(tm, tc) {
                 Ok(set) => {
-                    log!(logger, "Loaded target model {} ({} clusters) + config {}",
-                        tm, set.model.n_clusters(), tc);
+                    log!(logger, "Loaded target model {} ({} outputs) + config {}",
+                        tm, set.model.n_outputs(), tc);
                     target_set = Some(set);
                     last_target_model = tm.clone();
                     last_target_config = tc.clone();
@@ -902,8 +905,8 @@ fn main() -> Result<()> {
     let collect_mode = default_set.is_none();
 
     // Control-file poll timer. Independent of the classify/collect `duration`:
-    // every `control_interval` seconds we re-read the target ppid that an
-    // external scanner publishes. Coarse on purpose (the scan is cheap and
+    // re-read the control ppid and target set every `control_interval` (default
+    // 5s — the scan thread's result is written to tmpfs; polled here so even
     // a little lag is fine). First check fires immediately.
     let control_interval = Duration::from_secs(args.control_interval);
     let mut last_control_check = Instant::now() - control_interval;
