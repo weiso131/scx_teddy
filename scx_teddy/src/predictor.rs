@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::fs;
-use crate::predictors::kmeans::{KMeansModel, KMeansPredictor};
+use crate::predictors::kmeans::{KMeansCollector, KMeansModel, KMeansPredictor};
 use crate::task_stats::TaskStats;
 
 pub trait Predictor: Send + Sync {
@@ -11,6 +11,27 @@ pub trait Predictor: Send + Sync {
 
     /// Number of output categories (clusters or classes).
     fn n_outputs(&self) -> usize;
+}
+
+pub trait Collector: Send + Sync {
+    /// Returns (name, value) pairs for all features.
+    /// The order here defines the CSV column order and feature vector order.
+    fn named_stats(&self, stats: &TaskStats) -> Vec<(&'static str, f64)>;
+
+    /// Returns feature values as a Vec (order matches named_stats).
+    fn feature_values(&self, stats: &TaskStats) -> Vec<f64>;
+
+    /// Returns feature names (order matches feature_values).
+    fn feature_names(&self) -> Vec<&'static str>;
+}
+
+/// Load a collector by algorithm name. Mirrors `load_predictor` so the feature
+/// set used for collection can be switched the same way the predictor is.
+pub fn load_collector(algorithm: &str) -> Result<Box<dyn Collector>> {
+    match algorithm {
+        "kmeans" => Ok(Box::new(KMeansCollector)),
+        _ => bail!("Unsupported algorithm: {}", algorithm),
+    }
 }
 
 /// Load a predictor from a JSON model file.

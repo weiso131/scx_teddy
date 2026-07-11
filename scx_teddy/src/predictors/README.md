@@ -36,6 +36,25 @@ Which features a predictor reads is entirely up to it. It gets the whole
 `TaskStats`, so it picks whatever it needs. See `kmeans.rs` for a full
 example, including how it collects named features from `TaskStats`.
 
+## The `Collector` trait
+
+A collector defines the named feature set for one algorithm — the columns
+written by collect mode and the values a predictor of the same algorithm reads.
+
+```rust
+pub trait Collector: Send + Sync {
+    fn named_stats(&self, stats: &TaskStats) -> Vec<(&'static str, f64)>;
+    fn feature_values(&self, stats: &TaskStats) -> Vec<f64>;
+    fn feature_names(&self) -> Vec<&'static str>;
+}
+```
+
+`load_collector(algorithm)` (`src/predictor.rs`) picks one by name, mirroring
+`load_predictor`. To add one, implement `Collector` for your type and add a
+match arm to `load_collector`. `kmeans.rs` also exposes the same three as
+inherent associated functions so its own `Predictor` can call them without an
+instance.
+
 ## The `need_update` flag (read this)
 
 `TaskStats::need_update` is set to `1` by `TaskStats` itself whenever new

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use crate::predictor::Predictor;
+use crate::predictor::{Collector, Predictor};
 use crate::task_stats::TaskStats;
 
 pub struct KMeansCollector;
@@ -28,6 +28,20 @@ impl KMeansCollector {
     /// Returns feature names (order matches feature_values).
     pub fn feature_names() -> Vec<&'static str> {
         Self::named_stats(&TaskStats::default()).into_iter().map(|(n, _)| n).collect()
+    }
+}
+
+impl Collector for KMeansCollector {
+    fn named_stats(&self, stats: &TaskStats) -> Vec<(&'static str, f64)> {
+        Self::named_stats(stats)
+    }
+
+    fn feature_values(&self, stats: &TaskStats) -> Vec<f64> {
+        Self::feature_values(stats)
+    }
+
+    fn feature_names(&self) -> Vec<&'static str> {
+        Self::feature_names()
     }
 }
 

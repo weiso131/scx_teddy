@@ -29,7 +29,7 @@ mod topology;
 
 use task_stats::TaskStats;
 use crate::task_stats::TaskEvent;
-use crate::predictors::kmeans::KMeansCollector;
+use crate::predictor::{Collector, load_collector};
 
 mod bpf_skel {
     include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"));
@@ -325,8 +325,8 @@ fn process_event(
     0
 }
 
-fn csv_header() -> String {
-    let feature_names = KMeansCollector::feature_names();
+fn csv_header(collector: &dyn Collector) -> String {
+    let feature_names = collector.feature_names();
     let mut header = String::from("tid,tgid,ancestor,comm");
     for name in &feature_names {
         header.push(',');
@@ -360,11 +360,11 @@ fn read_proc_comm(tid: i32) -> String {
 /// Format one task's stats into a CSV row. `ancestor` is the Union-Find
 /// root from `climb_to_root` (1 = not a target descendant, or the target
 /// PPID), not the real parent — so it comes from TaskStats, not /proc.
-fn task_csv_row(tid: i32, task_stats: &TaskStats) -> String {
+fn task_csv_row(tid: i32, task_stats: &TaskStats, collector: &dyn Collector) -> String {
     let tgid = read_proc_field(tid, "Tgid")
         .map(|v| v.to_string()).unwrap_or_default();
     let comm = read_proc_comm(tid);
-    let values: Vec<String> = KMeansCollector::feature_values(task_stats).iter()
+    let values: Vec<String> = collector.feature_values(task_stats).iter()
         .map(|v| format!("{}", v)).collect();
     format!("{},{},{},{},{}", tid, tgid, task_stats.ancestor, comm, values.join(","))
 }
@@ -372,10 +372,10 @@ fn task_csv_row(tid: i32, task_stats: &TaskStats) -> String {
 /// Write `rows` to a fresh CSV at `path`, header first. The output path is
 /// checked for non-existence at startup, so this is a plain write — no merge
 /// with any prior file. Returns the number of rows written.
-fn write_csv(path: &str, rows: &[(i32, String)]) -> Result<usize> {
+fn write_csv(path: &str, rows: &[(i32, String)], collector: &dyn Collector) -> Result<usize> {
     let mut file = std::fs::File::create(path)
         .context("Failed to create output CSV")?;
-    writeln!(file, "{}", csv_header())
+    writeln!(file, "{}", csv_header(collector))
         .context("Failed to write CSV header")?;
     for (_, row) in rows {
         writeln!(file, "{}", row)
@@ -392,19 +392,20 @@ fn collect_data(
     output: &str,
     min_events: u64,
     target_ppid: i32,
+    collector: &dyn Collector,
 ) -> Result<usize> {
     let rows: Vec<(i32, String)> = stats_map.iter()
         .filter_map(|(&tid, cell)| {
             let mut ts = cell.borrow_mut();
             if ts.exit == 0 && ts.event_count >= min_events {
                 climb_to_root(&mut ts, stats_map, target_ppid);
-                Some((tid, task_csv_row(tid, &ts)))
+                Some((tid, task_csv_row(tid, &ts, collector)))
             } else {
                 None
             }
         })
         .collect();
-    write_csv(output, &rows)
+    write_csv(output, &rows, collector)
 }
 
 /// Advance one task's Union-Find ancestor pointer by ONE halving step
@@ -623,6 +624,7 @@ fn run_classify_cycle(
     min_events: u64,
     target_ppid: i32,
     own_tid: i32,
+    collector: &dyn Collector,
     logger: &Rc<RefCell<Logger>>,
 ) -> Result<()> {
     // GUI Overall feed: one entry per task predicted this cycle (i.e. that
@@ -672,7 +674,7 @@ fn run_classify_cycle(
         let Some(cluster) = set.model.predict(&mut ts) else {
             continue;
         };
-        let named_stats = KMeansCollector::named_stats(&ts);
+        let named_stats = collector.named_stats(&ts);
         predict_count += 1;
 
         let cluster_cfg = set.config.clusters
@@ -783,6 +785,8 @@ fn main() -> Result<()> {
     // Process-progress logger: quiet unless --verbose, in which case every
     // log! call goes to a file.
     let logger = Rc::new(RefCell::new(Logger::new(args.verbose)));
+
+    let collector = load_collector("kmeans")?;
 
     // Load the default model + config for classify mode (required). The target
     // set is optional and may also be set/changed later via the control files.
@@ -956,12 +960,12 @@ fn main() -> Result<()> {
             if let Some(default_set) = &default_set {
                 run_classify_cycle(&stats.borrow(), update_map,
                     default_set, target_set.as_ref(), args.min_events,
-                    target_ppid.get(), own_tid, &logger)?;
+                    target_ppid.get(), own_tid, &*collector, &logger)?;
             } else if args.csv_checkpoint {
                 // Collect mode writes the CSV every cycle only with this flag;
                 // otherwise it is flushed once on shutdown.
                 let n = collect_data(&stats.borrow(), &args.output,
-                    args.min_events, target_ppid.get())?;
+                    args.min_events, target_ppid.get(), &*collector)?;
                 log!(logger, "CSV written: {} rows", n);
             }
 
@@ -982,7 +986,7 @@ fn main() -> Result<()> {
     // Flush the CSV on shutdown (collect mode).
     if collect_mode {
         let n = collect_data(&stats.borrow(), &args.output,
-            args.min_events, target_ppid.get())?;
+            args.min_events, target_ppid.get(), &*collector)?;
         log!(logger, "CSV written: {} rows", n);
     }
 
