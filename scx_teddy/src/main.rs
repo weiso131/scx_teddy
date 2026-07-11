@@ -29,6 +29,7 @@ mod topology;
 
 use task_stats::TaskStats;
 use crate::task_stats::TaskEvent;
+use crate::predictors::kmeans::KMeansCollector;
 
 mod bpf_skel {
     include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"));
@@ -325,7 +326,7 @@ fn process_event(
 }
 
 fn csv_header() -> String {
-    let feature_names = TaskStats::get_feature_names();
+    let feature_names = KMeansCollector::feature_names();
     let mut header = String::from("tid,tgid,ancestor,comm");
     for name in &feature_names {
         header.push(',');
@@ -363,7 +364,7 @@ fn task_csv_row(tid: i32, task_stats: &TaskStats) -> String {
     let tgid = read_proc_field(tid, "Tgid")
         .map(|v| v.to_string()).unwrap_or_default();
     let comm = read_proc_comm(tid);
-    let values: Vec<String> = task_stats.get_stats().iter()
+    let values: Vec<String> = KMeansCollector::feature_values(task_stats).iter()
         .map(|v| format!("{}", v)).collect();
     format!("{},{},{},{},{}", tid, tgid, task_stats.ancestor, comm, values.join(","))
 }
@@ -668,10 +669,10 @@ fn run_classify_cycle(
             }
         }
 
-        let Some((features, named_stats)) = ts.take_features_if_needed() else {
+        let Some(cluster) = set.model.predict(&mut ts) else {
             continue;
         };
-        let cluster = set.model.predict(&features);
+        let named_stats = KMeansCollector::named_stats(&ts);
         predict_count += 1;
 
         let cluster_cfg = set.config.clusters

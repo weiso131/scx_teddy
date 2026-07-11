@@ -1,11 +1,13 @@
 use anyhow::{Context, Result, bail};
 use std::fs;
 use crate::predictors::kmeans::{KMeansModel, KMeansPredictor};
+use crate::task_stats::TaskStats;
 
 pub trait Predictor: Send + Sync {
-    /// Predict cluster/class index for a feature vector.
-    /// `raw_features` should match the order from `TaskStats::get_feature_names()`.
-    fn predict(&self, raw_features: &[f64]) -> usize;
+    /// Predict cluster/class index for a task's stats. The predictor decides
+    /// which fields it reads and whether to consume `need_update`. Returns
+    /// None when there is nothing to predict this cycle.
+    fn predict(&self, stats: &mut TaskStats) -> Option<usize>;
 
     /// Number of output categories (clusters or classes).
     fn n_outputs(&self) -> usize;

@@ -3,6 +3,34 @@ use serde::Deserialize;
 use crate::predictor::Predictor;
 use crate::task_stats::TaskStats;
 
+pub struct KMeansCollector;
+
+impl KMeansCollector {
+    /// Returns (name, value) pairs for all features.
+    /// The order here defines the CSV column order and feature vector order.
+    pub fn named_stats(stats: &TaskStats) -> Vec<(&'static str, f64)> {
+        vec![
+            ("runtime_ms", stats.avg_runtime_ms()),
+            ("runtime_cv", stats.runtime_cv()),
+            ("avg_sleep_ms", stats.avg_sleep_ms()),
+            ("sleep_cv", stats.sleep_cv()),
+            ("iowait_ratio", stats.sleep_base_ratio(stats.in_iowait_cnt)),
+            ("futex_wait_ratio", stats.sleep_base_ratio(stats.futex_wait_cnt)),
+            ("runtime_ratio", stats.avg_runtime_ms() / (stats.avg_runtime_ms() + stats.avg_sleep_ms())),
+        ]
+    }
+
+    /// Returns feature values as a Vec (order matches named_stats).
+    pub fn feature_values(stats: &TaskStats) -> Vec<f64> {
+        Self::named_stats(stats).into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Returns feature names (order matches feature_values).
+    pub fn feature_names() -> Vec<&'static str> {
+        Self::named_stats(&TaskStats::default()).into_iter().map(|(n, _)| n).collect()
+    }
+}
+
 #[derive(Deserialize)]
 struct KMeansScaler {
     mean: Vec<f64>,
@@ -43,7 +71,7 @@ impl KMeansPredictor {
         }
 
         // Map feature names to indices
-        let available_features = TaskStats::get_feature_names();
+        let available_features = KMeansCollector::feature_names();
         let mut feature_indices = Vec::new();
         for f_name in &model.features {
             let idx = available_features
@@ -72,7 +100,14 @@ impl KMeansPredictor {
 }
 
 impl Predictor for KMeansPredictor {
-    fn predict(&self, raw_features: &[f64]) -> usize {
+    fn predict(&self, stats: &mut TaskStats) -> Option<usize> {
+        if stats.need_update == 0 {
+            return None;
+        }
+        stats.need_update = 0;
+
+        let raw_features = KMeansCollector::feature_values(stats);
+
         // 1. Extract only the features this model was trained on
         let selected: Vec<f64> = self.feature_indices
             .iter()
@@ -97,7 +132,7 @@ impl Predictor for KMeansPredictor {
                 best_cluster = i;
             }
         }
-        best_cluster
+        Some(best_cluster)
     }
 
     fn n_outputs(&self) -> usize {
