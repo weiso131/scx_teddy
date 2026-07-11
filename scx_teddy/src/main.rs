@@ -22,7 +22,8 @@ use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore;
 use libbpf_rs::MapFlags;
 
-mod classifier;
+mod predictor;
+mod predictors;
 mod task_stats;
 mod topology;
 
@@ -80,14 +81,14 @@ struct SchedConfig {
 /// unknown cluster id falls back to the config's `default` entry; the GUI
 /// validates the model↔config pairing.
 struct SchedSet {
-    model: Box<dyn classifier::Predictor>,
+    model: Box<dyn predictor::Predictor>,
     config: SchedConfig,
 }
 
 /// Load a model + config into a SchedSet. Errors are returned so the caller can
 /// abort (startup) or keep the previous set (live control-file reload).
 fn load_sched_set(model_path: &str, config_path: &str) -> Result<SchedSet> {
-    let model = classifier::load_predictor(model_path)?;
+    let model = predictor::load_predictor(model_path)?;
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config: {}", config_path))?;
     let config: SchedConfig = serde_json::from_str(&content)
