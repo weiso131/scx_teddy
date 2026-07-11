@@ -18,6 +18,11 @@ typedef signed long s64;
 #define MODE_TGID   1
 
 #define DSQ_BASE 200
+/* Experimental vtime DSQ block, kept in a low id range that never overlaps
+ * DSQ_BASE. One slot per (1 + cpu_kind_num): slot 0 = shared, slot k = kind k.
+ * A task with target_ctx->wait != 0 is inserted here with vtime = now + wait,
+ * meaning it may not run until that deadline passes. */
+#define EXP_DSQ_BASE 100
 #define PRIORITY_NUM 12
 #define CRITICAL_PRIO 4 // prio < 4 is critical
 #define DEFAULT_PRIO 11 // use lowest priority as default
@@ -47,6 +52,7 @@ typedef struct task_info {
     u8 kind;  // DSQ slot: 0 = shared (any kind), 1..cpu_kind_num = kind-only
     u8 cpu_prefer;
     u64 slice; // ns
+    u64 expt_wait;  // experimental vtime DSQ deadline (ns); 0 = disabled
 } sched_info_t;
 
 typedef struct target_ctx {
@@ -56,6 +62,7 @@ typedef struct target_ctx {
     /* | 7 bits NOP | 1 bits ecore |*/
     u8 kind;  // DSQ slot: 0 = shared (any kind), 1..cpu_kind_num = kind-only
     u8 cpu_prefer;
+    u64 expt_wait;  // experimental vtime DSQ deadline (ns); 0 = disabled
 
     u64 start_running;
     u64 sleep_start;

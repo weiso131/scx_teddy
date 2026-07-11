@@ -197,8 +197,8 @@ fn own_tid() -> i32 {
     unsafe { gettid() }
 }
 
-/// Pack a `sched_info_t {prio: s32, kind: u8, cpu_prefer: u8, slice: u64}` and
-/// write it into `update_map` for `tid`.
+/// Pack a `sched_info_t {prio: s32, kind: u8, cpu_prefer: u8, slice: u64,
+/// expt_wait: u64}` and write it into `update_map` for `tid`.
 fn write_sched_info(
     update_map: &libbpf_rs::Map,
     tid: i32,
@@ -206,13 +206,15 @@ fn write_sched_info(
     cpu_kind: u8,
     cpu_prefer: u8,
     slice_ns: u64,
+    expt_wait: u64,
 ) -> Result<()> {
     let tid_key = tid.to_ne_bytes();
-    let mut val_buf = [0u8; 16];
+    let mut val_buf = [0u8; 24];
     val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
     val_buf[4] = cpu_kind;
     val_buf[5] = cpu_prefer;
     val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
+    val_buf[16..24].copy_from_slice(&expt_wait.to_ne_bytes());
     update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
     Ok(())
 }
@@ -692,7 +694,7 @@ fn run_classify_cycle(
         });
 
         write_sched_info(update_map, tid, prio,
-            cluster_cfg.cpu_kind, cluster_cfg.cpu_prefer, slice_ns)?;
+            cluster_cfg.cpu_kind, cluster_cfg.cpu_prefer, slice_ns, 0)?;
     }
 
     // Publish the snapshot for the GUI. Done before the timing log so the
@@ -894,7 +896,7 @@ fn main() -> Result<()> {
 
     // Give it the highest priority (0) so it is never starved by its own policy
     let own_tid = own_tid();
-    write_sched_info(update_map, own_tid, 0, 0, CPU_SLOW_PREFER, DEFAULT_SLICE_NS)
+    write_sched_info(update_map, own_tid, 0, 0, CPU_SLOW_PREFER, DEFAULT_SLICE_NS, 0)
         .context("Failed to seed scx_teddy's own scheduling info")?;
     log!(logger, "seeded own tid {} at prio 0, kind 0, prefer slow (self-protection)", own_tid);
 

@@ -86,6 +86,23 @@ static __always_inline void insert_kind_dsq(struct task_struct *p, s32 prio,
     }
 }
 
+/* Experimental DSQ id for a kind slot. slot 0 = shared, slot k = CPU kind k. */
+static __always_inline u64 exp_dsq_id(u32 kind)
+{
+    return EXP_DSQ_BASE + kind;
+}
+
+/* Insert p into the experimental vtime DSQ for its kind, with a deadline of
+ * now + target_ctx->expt_wait. The task may not run until that deadline passes
+ * (dispatch pulls it only once now >= vtime). */
+static __always_inline void insert_exp_dsq(struct task_struct *p,
+                                           target_ctx_t *target_ctx, u64 enq_flags)
+{
+    u64 vtime = scx_bpf_now() + target_ctx->expt_wait;
+    scx_bpf_dsq_insert_vtime(p, exp_dsq_id(target_ctx->kind), target_ctx->slice,
+                             vtime, enq_flags);
+}
+
 #define MIN_SEND_INTERVAL 100000000
 
 struct {
@@ -175,6 +192,7 @@ static target_ctx_t *get_target_storage(struct task_struct *p)
         target_ctx->prio = DEFAULT_PRIO;
         target_ctx->config = 1;
         target_ctx->kind = 0; // default: shared DSQ (no kind restriction)
+        target_ctx->expt_wait = 0; // experimental vtime DSQ disabled by default
         target_ctx->last_send_time = bpf_ktime_get_ns();
 
         target_ctx->start_running = target_ctx->sleep_start = target_ctx->sleep_end = target_ctx->runtime_ns = 0;
@@ -235,6 +253,13 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
         return prev_cpu;
     }
 
+    /* Experimental: a task with expt_wait set goes straight into the experimental
+     * vtime DSQ and skips the rest of select_cpu (and enqueue). */
+    if (target_ctx->expt_wait != 0) {
+        insert_exp_dsq(p, target_ctx, wake_flags);
+        return prev_cpu;
+    }
+
     if (target_ctx->prio >= CRITICAL_PRIO) {
         insert_kind_dsq(p, target_ctx->prio, target_ctx->kind, DEFAULT_SLICE, wake_flags);
         return prev_cpu;
@@ -284,6 +309,12 @@ void BPF_STRUCT_OPS(teddy_enqueue, struct task_struct *p, u64 enq_flags)
         return;
     }
 
+    /* Experimental: expt_wait set -> experimental vtime DSQ (same as select_cpu). */
+    if (target_ctx->expt_wait != 0) {
+        insert_exp_dsq(p, target_ctx, enq_flags);
+        return;
+    }
+
     insert_kind_dsq(p, target_ctx->prio, target_ctx->kind,
                     target_ctx->slice, enq_flags);
 }
@@ -298,6 +329,23 @@ void BPF_STRUCT_OPS(teddy_dispatch, s32 cpu, struct task_struct *prev)
         return;
     /* This CPU's kind selects which kind-only DSQ this CPU may pull from. */
     u32 kind = cpu_info[cpu].cpu_kind;
+
+    /* Experimental: highest priority of all. Pull from the experimental vtime
+     * DSQ (shared slot then this CPU's kind slot) only when the head task's
+     * deadline has passed — a task waits there until now >= its vtime. */
+    {
+        u64 now_exp = scx_bpf_now();
+        struct task_struct *head = scx_bpf_dsq_peek(exp_dsq_id(0));
+        if (head && now_exp >= head->scx.dsq_vtime) {
+            if (scx_bpf_dsq_move_to_local(exp_dsq_id(0)))
+                return;
+        }
+        head = scx_bpf_dsq_peek(exp_dsq_id(kind));
+        if (head && now_exp >= head->scx.dsq_vtime) {
+            if (scx_bpf_dsq_move_to_local(exp_dsq_id(kind)))
+                return;
+        }
+    }
 
     /* A non-fastest CPU (e.g. an E-core) may also rescue tasks stranded on the
      * fastest-kind (P-core) vtime DSQ once their deadline has passed — see
@@ -356,6 +404,16 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(teddy_init)
         if (i >= dsq_total)
             break;
         s32 ret = scx_bpf_create_dsq(DSQ_BASE + i, -1);
+        if (ret < 0)
+            return ret;
+    }
+
+    /* Experimental vtime DSQ block: 1 + cpu_kind_num slots (shared + per kind),
+     * not split by priority. Bounded by the compile-time max for the verifier. */
+    for (u32 i = 0; i < 1 + MAX_CPU_KIND; i++) {
+        if (i >= dsq_per_prio())
+            break;
+        s32 ret = scx_bpf_create_dsq(EXP_DSQ_BASE + i, -1);
         if (ret < 0)
             return ret;
     }
@@ -444,6 +502,7 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
     if (unlikely(update_info)) {
         target_ctx->prio = update_info->prio;
         target_ctx->slice = update_info->slice;
+        target_ctx->expt_wait = update_info->expt_wait;
 
         /* Only apply the cpu_kind setting when the task is not bound
          * to a specific CPU. */
