@@ -22,12 +22,14 @@ use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore;
 use libbpf_rs::MapFlags;
 
-mod classifier;
+mod predictor;
+mod predictors;
 mod task_stats;
 mod topology;
 
 use task_stats::TaskStats;
 use crate::task_stats::TaskEvent;
+use crate::predictor::{Collector, load_collector};
 
 mod bpf_skel {
     include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"));
@@ -80,14 +82,14 @@ struct SchedConfig {
 /// unknown cluster id falls back to the config's `default` entry; the GUI
 /// validates the model↔config pairing.
 struct SchedSet {
-    model: Box<dyn classifier::Classifier>,
+    model: Box<dyn predictor::Predictor>,
     config: SchedConfig,
 }
 
 /// Load a model + config into a SchedSet. Errors are returned so the caller can
 /// abort (startup) or keep the previous set (live control-file reload).
 fn load_sched_set(model_path: &str, config_path: &str) -> Result<SchedSet> {
-    let model = classifier::load_model(model_path)?;
+    let model = predictor::load_predictor(model_path)?;
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config: {}", config_path))?;
     let config: SchedConfig = serde_json::from_str(&content)
@@ -323,8 +325,8 @@ fn process_event(
     0
 }
 
-fn csv_header() -> String {
-    let feature_names = TaskStats::get_feature_names();
+fn csv_header(collector: &dyn Collector) -> String {
+    let feature_names = collector.feature_names();
     let mut header = String::from("tid,tgid,ancestor,comm");
     for name in &feature_names {
         header.push(',');
@@ -358,11 +360,11 @@ fn read_proc_comm(tid: i32) -> String {
 /// Format one task's stats into a CSV row. `ancestor` is the Union-Find
 /// root from `climb_to_root` (1 = not a target descendant, or the target
 /// PPID), not the real parent — so it comes from TaskStats, not /proc.
-fn task_csv_row(tid: i32, task_stats: &TaskStats) -> String {
+fn task_csv_row(tid: i32, task_stats: &TaskStats, collector: &dyn Collector) -> String {
     let tgid = read_proc_field(tid, "Tgid")
         .map(|v| v.to_string()).unwrap_or_default();
     let comm = read_proc_comm(tid);
-    let values: Vec<String> = task_stats.get_stats().iter()
+    let values: Vec<String> = collector.feature_values(task_stats).iter()
         .map(|v| format!("{}", v)).collect();
     format!("{},{},{},{},{}", tid, tgid, task_stats.ancestor, comm, values.join(","))
 }
@@ -370,10 +372,10 @@ fn task_csv_row(tid: i32, task_stats: &TaskStats) -> String {
 /// Write `rows` to a fresh CSV at `path`, header first. The output path is
 /// checked for non-existence at startup, so this is a plain write — no merge
 /// with any prior file. Returns the number of rows written.
-fn write_csv(path: &str, rows: &[(i32, String)]) -> Result<usize> {
+fn write_csv(path: &str, rows: &[(i32, String)], collector: &dyn Collector) -> Result<usize> {
     let mut file = std::fs::File::create(path)
         .context("Failed to create output CSV")?;
-    writeln!(file, "{}", csv_header())
+    writeln!(file, "{}", csv_header(collector))
         .context("Failed to write CSV header")?;
     for (_, row) in rows {
         writeln!(file, "{}", row)
@@ -390,19 +392,20 @@ fn collect_data(
     output: &str,
     min_events: u64,
     target_ppid: i32,
+    collector: &dyn Collector,
 ) -> Result<usize> {
     let rows: Vec<(i32, String)> = stats_map.iter()
         .filter_map(|(&tid, cell)| {
             let mut ts = cell.borrow_mut();
             if ts.exit == 0 && ts.event_count >= min_events {
                 climb_to_root(&mut ts, stats_map, target_ppid);
-                Some((tid, task_csv_row(tid, &ts)))
+                Some((tid, task_csv_row(tid, &ts, collector)))
             } else {
                 None
             }
         })
         .collect();
-    write_csv(output, &rows)
+    write_csv(output, &rows, collector)
 }
 
 /// Advance one task's Union-Find ancestor pointer by ONE halving step
@@ -621,6 +624,7 @@ fn run_classify_cycle(
     min_events: u64,
     target_ppid: i32,
     own_tid: i32,
+    collector: &dyn Collector,
     logger: &Rc<RefCell<Logger>>,
 ) -> Result<()> {
     // GUI Overall feed: one entry per task predicted this cycle (i.e. that
@@ -667,10 +671,10 @@ fn run_classify_cycle(
             }
         }
 
-        let Some((features, named_stats)) = ts.take_features_if_needed() else {
+        let Some(cluster) = set.model.predict(&mut ts) else {
             continue;
         };
-        let cluster = set.model.predict(&features);
+        let named_stats = collector.named_stats(&ts);
         predict_count += 1;
 
         let cluster_cfg = set.config.clusters
@@ -700,6 +704,9 @@ fn run_classify_cycle(
     let avg_per_task_ns = if predict_count > 0 {
         (batch_cpu_us * 1000) / predict_count as u128
     } else { 0 };
+
+    log!(logger, "  [timing] batch wall={}us cpu={}us avg={}ns/task over {} tasks",
+        batch_wall_us, batch_cpu_us, avg_per_task_ns, predict_count);
 
     Ok(())
 }
@@ -779,6 +786,8 @@ fn main() -> Result<()> {
     // log! call goes to a file.
     let logger = Rc::new(RefCell::new(Logger::new(args.verbose)));
 
+    let collector = load_collector("kmeans")?;
+
     // Load the default model + config for classify mode (required). The target
     // set is optional and may also be set/changed later via the control files.
     let default_set = if args.mode == "classify" {
@@ -787,8 +796,8 @@ fn main() -> Result<()> {
         let config_path = args.config.as_deref()
             .context("Classify mode requires --config <path>")?;
         let set = load_sched_set(model_path, config_path)?;
-        log!(logger, "Loaded default model {} ({} clusters) + config {}",
-            model_path, set.model.n_clusters(), config_path);
+        log!(logger, "Loaded default model {} ({} outputs) + config {}",
+            model_path, set.model.n_outputs(), config_path);
         Some(set)
     } else {
         None
@@ -804,8 +813,8 @@ fn main() -> Result<()> {
         if let (Some(tm), Some(tc)) = (&args.target_model, &args.target_config) {
             match load_sched_set(tm, tc) {
                 Ok(set) => {
-                    log!(logger, "Loaded target model {} ({} clusters) + config {}",
-                        tm, set.model.n_clusters(), tc);
+                    log!(logger, "Loaded target model {} ({} outputs) + config {}",
+                        tm, set.model.n_outputs(), tc);
                     target_set = Some(set);
                     last_target_model = tm.clone();
                     last_target_config = tc.clone();
@@ -902,8 +911,8 @@ fn main() -> Result<()> {
     let collect_mode = default_set.is_none();
 
     // Control-file poll timer. Independent of the classify/collect `duration`:
-    // every `control_interval` seconds we re-read the target ppid that an
-    // external scanner publishes. Coarse on purpose (the scan is cheap and
+    // re-read the control ppid and target set every `control_interval` (default
+    // 5s — the scan thread's result is written to tmpfs; polled here so even
     // a little lag is fine). First check fires immediately.
     let control_interval = Duration::from_secs(args.control_interval);
     let mut last_control_check = Instant::now() - control_interval;
@@ -951,12 +960,12 @@ fn main() -> Result<()> {
             if let Some(default_set) = &default_set {
                 run_classify_cycle(&stats.borrow(), update_map,
                     default_set, target_set.as_ref(), args.min_events,
-                    target_ppid.get(), own_tid, &logger)?;
+                    target_ppid.get(), own_tid, &*collector, &logger)?;
             } else if args.csv_checkpoint {
                 // Collect mode writes the CSV every cycle only with this flag;
                 // otherwise it is flushed once on shutdown.
                 let n = collect_data(&stats.borrow(), &args.output,
-                    args.min_events, target_ppid.get())?;
+                    args.min_events, target_ppid.get(), &*collector)?;
                 log!(logger, "CSV written: {} rows", n);
             }
 
@@ -977,7 +986,7 @@ fn main() -> Result<()> {
     // Flush the CSV on shutdown (collect mode).
     if collect_mode {
         let n = collect_data(&stats.borrow(), &args.output,
-            args.min_events, target_ppid.get())?;
+            args.min_events, target_ppid.get(), &*collector)?;
         log!(logger, "CSV written: {} rows", n);
     }
 
