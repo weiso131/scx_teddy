@@ -103,6 +103,24 @@ static __always_inline void insert_exp_dsq(struct task_struct *p,
                              vtime, enq_flags);
 }
 
+static __always_inline u64 ewma_decay(u64 old, u64 sample)
+{
+    if (unlikely(old == 0))
+        return sample;
+    return (old * ((1ULL << EWMA_SHIFT) - 1) + sample) >> EWMA_SHIFT;
+}
+
+static __always_inline void update_sched_delay(target_ctx_t *target_ctx, u64 now)
+{
+    if (unlikely(target_ctx->wait_start == 0))
+        return;
+    u64 sample = now - target_ctx->wait_start;
+    if (unlikely(sample == 0))
+        sample = 1;
+    target_ctx->sched_delay_ewma = ewma_decay(target_ctx->sched_delay_ewma, sample);
+    target_ctx->wait_start = 0;
+}
+
 #define MIN_SEND_INTERVAL 100000000
 
 struct {
@@ -163,6 +181,8 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     e->sleep_cnt = target_ctx->sleep_cnt;
     e->in_iowait_cnt = target_ctx->in_iowait_cnt;
     e->futex_wait_cnt = target_ctx->futex_wait_cnt;
+    /* Current EWMA value, not an accumulator: sent as-is and never reset. */
+    e->sched_delay_ewma = target_ctx->sched_delay_ewma;
 
     // Submit to ring buffer
     bpf_ringbuf_submit(e, 0);
@@ -196,6 +216,7 @@ static target_ctx_t *get_target_storage(struct task_struct *p)
         target_ctx->last_send_time = bpf_ktime_get_ns();
 
         target_ctx->start_running = target_ctx->sleep_start = target_ctx->sleep_end = target_ctx->runtime_ns = 0;
+        target_ctx->wait_start = target_ctx->sched_delay_ewma = 0;
     }
 
     return target_ctx;
@@ -426,8 +447,11 @@ void BPF_STRUCT_OPS(teddy_runnable, struct task_struct *p, u64 enq_flags)
     target_ctx_t *target_ctx = get_target_storage(p);
     if (!target_ctx)
         return;
+    u64 now = scx_bpf_now();
+    /* Scheduling delay starts counting the moment the task becomes runnable. */
+    target_ctx->wait_start = now;
     if (enq_flags & SCX_ENQ_WAKEUP)
-        target_ctx->sleep_end = scx_bpf_now();
+        target_ctx->sleep_end = now;
 }
 
 void BPF_STRUCT_OPS(teddy_running, struct task_struct *p)
@@ -435,7 +459,9 @@ void BPF_STRUCT_OPS(teddy_running, struct task_struct *p)
     target_ctx_t *target_ctx = get_target_storage(p);
     if (!target_ctx)
         return;
-    target_ctx->start_running = scx_bpf_now();
+    u64 now = scx_bpf_now();
+    update_sched_delay(target_ctx, now);
+    target_ctx->start_running = now;
 }
 
 static void update_event_data(target_ctx_t *target_ctx)
@@ -491,6 +517,9 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
         }
         target_ctx->sleep_start = now;
     } else {
+        /* Still runnable (slice used up): it goes back to the queue, so the
+         * scheduling delay starts counting again from here. */
+        target_ctx->wait_start = now;
         if (target_ctx->runtime_ns >= RUNTIME_MAX_TIME) {
             update_event_data(target_ctx);
             try_data_to_user(p, target_ctx);

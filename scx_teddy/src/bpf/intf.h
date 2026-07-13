@@ -29,6 +29,10 @@ typedef signed long s64;
 
 #define DEFAULT_SLICE 100 * 1000
 
+/* Scheduling-delay EWMA weight: new = (old * (N-1) + sample) / N, with
+ * N = 1 << EWMA_SHIFT. Plain integer mul/div for now; fixed-point later. */
+#define EWMA_SHIFT 3
+
 /* Upper bound on logical CPUs for the topology arrays below. */
 #define MAX_CPU 255
 
@@ -69,6 +73,12 @@ typedef struct target_ctx {
     u64 sleep_end;
     u64 runtime_ns;
 
+    /* Scheduling delay: set when the task becomes runnable (wakeup) or is
+     * preempted while still runnable (slice used up); consumed in running to
+     * feed the EWMA below. */
+    u64 wait_start;
+    u64 sched_delay_ewma; // ns
+
     u64 last_send_time;
 
     u32 event_cnt;
@@ -89,6 +99,7 @@ typedef struct task_event {
     u64 sleep_sq_sum;
     u64 runtime_sum;
     u64 runtime_sq_sum;
+    u64 sched_delay_ewma; // ns, current value (not accumulated/reset)
     u32 sleep_cnt;
     u32 in_iowait_cnt;
     u32 futex_wait_cnt;
