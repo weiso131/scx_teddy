@@ -1,0 +1,141 @@
+//! Game FPS metric, read from the Vulkan layer in the `latency_creater` project
+//! (its `game_fps/` directory). The layer intercepts `vkQueuePresentKHR`, and we
+//! talk to it over a POSIX shared-memory buffer.
+//!
+//! Reader-driven request/response: we store `request = 1`, then block on
+//! FUTEX_WAIT until the layer clears it. The layer notices the request on its
+//! next present, accumulates one window, writes the fields, sets `request = 0`
+//! and wakes us. It will not write again until we re-arm, so we own the buffer
+//! while reading it — no seqlock needed.
+//!
+//! With no game running the layer never clears `request`, so `measure` simply
+//! stays parked in FUTEX_WAIT at ~0 CPU.
+//!
+//! Env:
+//!   LATENCY_SHM_NAME   shm name (default "/game_fps")
+
+use anyhow::{Result, anyhow};
+use std::cmp::Ordering;
+use std::ffi::CString;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+use crate::predictors::expt_tolerance::metric::Metric;
+
+/// Must match `FpsShm` in the layer's `game_fps/fps_shm.h` — both sides agree
+/// on this layout.
+#[repr(C)]
+struct FpsShm {
+    request: AtomicU32, // 1 = sample requested, 0 = idle / result ready
+    _pad: u32,
+    fps: f64,
+    min_frametime_ms: f64,
+    max_frametime_ms: f64,
+    frame_count: u64,
+}
+
+/// One measured window of game rendering.
+#[derive(Debug, Clone)]
+pub struct GameFps {
+    pub fps: f64,
+    pub min_frametime_ms: f64,
+    pub max_frametime_ms: f64,
+    pub frame_count: u64,
+}
+
+/// The mapping lives for the whole process, so map it once and share it. The
+/// pointer is only ever used to reach the shm; `measure` has no `self` to hold it.
+struct ShmPtr(*mut FpsShm);
+unsafe impl Send for ShmPtr {}
+unsafe impl Sync for ShmPtr {}
+
+static SHM: OnceLock<ShmPtr> = OnceLock::new();
+
+/// Map the shm read-write (we set the request flag). `O_CREAT` so either side
+/// may start first: whoever opens it first creates it.
+fn map_shm(name: &str) -> Result<*mut FpsShm> {
+    let cname = CString::new(name)?;
+    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o666) };
+    if fd < 0 {
+        return Err(anyhow!(
+            "shm_open({name}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let size = std::mem::size_of::<FpsShm>();
+    // Size the object; harmless if it already exists at this size.
+    if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
+        unsafe { libc::close(fd) };
+        return Err(anyhow!("ftruncate failed: {}", std::io::Error::last_os_error()));
+    }
+    unsafe { libc::fchmod(fd, 0o666) };
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    unsafe { libc::close(fd) };
+    if p == libc::MAP_FAILED {
+        return Err(anyhow!("mmap failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(p as *mut FpsShm)
+}
+
+fn shm() -> Result<&'static FpsShm> {
+    let name = std::env::var("LATENCY_SHM_NAME").unwrap_or_else(|_| "/game_fps".to_string());
+    if SHM.get().is_none() {
+        let p = map_shm(&name)?;
+        // A concurrent initializer would leak one mapping; only one caller here.
+        let _ = SHM.set(ShmPtr(p));
+    }
+    let p = SHM.get().ok_or_else(|| anyhow!("shm not mapped"))?.0;
+    Ok(unsafe { &*p })
+}
+
+/// Block while `word` still equals `expected`. No timeout: if the layer never
+/// clears request (no game running), we stay parked at ~0 CPU.
+fn futex_wait(word: &AtomicU32, expected: u32) {
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word as *const AtomicU32,
+            libc::FUTEX_WAIT,
+            expected,
+            std::ptr::null::<libc::timespec>(),
+        );
+    }
+    // EAGAIN (already changed) and spurious wakeups just mean "re-check request".
+}
+
+impl Metric for GameFps {
+    fn measure() -> Result<Self> {
+        let shm = shm()?;
+
+        // Arm a request. The layer picks it up on its next present.
+        shm.request.store(1, AtomicOrdering::Release);
+
+        // Wait until the layer has measured a window and cleared request.
+        while shm.request.load(AtomicOrdering::Acquire) == 1 {
+            futex_wait(&shm.request, 1);
+        }
+
+        // The handshake guarantees the layer is not writing while request == 0.
+        Ok(GameFps {
+            fps: shm.fps,
+            min_frametime_ms: shm.min_frametime_ms,
+            max_frametime_ms: shm.max_frametime_ms,
+            frame_count: shm.frame_count,
+        })
+    }
+
+    /// Higher FPS is better, so `Less` means this sample rendered worse.
+    /// A NaN on either side is reported as indistinguishable.
+    fn compare(&self, other: &Self) -> Ordering {
+        self.fps.partial_cmp(&other.fps).unwrap_or(Ordering::Equal)
+    }
+}

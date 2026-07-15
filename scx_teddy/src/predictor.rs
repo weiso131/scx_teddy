@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::fs;
 use libbpf_rs::{MapCore, MapFlags};
 use crate::predictors::kmeans::{KMeansCollector, KMeansModel, KMeansPredictor};
+use crate::predictors::expt_tolerance::{ExptToleranceCollector, ExptToleranceModel, ExptTolerancePredictor};
 use crate::task_stats::TaskStats;
 
 /// The scheduling parameters a predictor decides for one task. Mirrors the BPF
@@ -21,9 +22,11 @@ pub struct SchedDecision {
 
 /// Pack a `sched_info_t {prio: s32, kind: u8, cpu_prefer: u8, slice: u64,
 /// expt_wait: u64}` and write it into `update_map` for `tid`. Predictors call
-/// this from `predict` to push a decision down to BPF.
+/// this from `predict` to push a decision down to BPF. Generic over the map so
+/// both a borrowed `Map` (main thread) and an owned `MapHandle` (an experiment
+/// thread) can write through it.
 pub fn write_sched_info(
-    update_map: &libbpf_rs::Map,
+    update_map: &impl MapCore,
     tid: i32,
     d: &SchedDecision,
 ) -> Result<()> {
@@ -79,6 +82,7 @@ pub trait Collector: Send + Sync {
 pub fn load_collector(algorithm: &str) -> Result<Box<dyn Collector>> {
     match algorithm {
         "kmeans" => Ok(Box::new(KMeansCollector)),
+        "expt_tolerance" => Ok(Box::new(ExptToleranceCollector)),
         _ => bail!("Unsupported algorithm: {}", algorithm),
     }
 }
@@ -101,6 +105,11 @@ pub fn load_predictor(model_path: &str, config_path: &str) -> Result<Box<dyn Pre
             let model: KMeansModel = serde_json::from_value(raw)
                 .context("Failed to parse KMeans model")?;
             Ok(Box::new(KMeansPredictor::from_model(model, config_path)?))
+        }
+        "expt_tolerance" => {
+            let model: ExptToleranceModel = serde_json::from_value(raw)
+                .context("Failed to parse expt_tolerance model")?;
+            Ok(Box::new(ExptTolerancePredictor::from_model(model, config_path)?))
         }
         _ => bail!("Unsupported algorithm: {}", algorithm),
     }
