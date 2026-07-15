@@ -131,24 +131,6 @@ fn own_tid() -> i32 {
     unsafe { gettid() }
 }
 
-/// Pack a `sched_info_t {prio: s32, kind: u8, cpu_prefer: u8, slice: u64,
-/// expt_wait: u64}` and write it into `update_map` for `tid`.
-fn write_sched_info(
-    update_map: &libbpf_rs::Map,
-    tid: i32,
-    d: &SchedDecision,
-) -> Result<()> {
-    let tid_key = tid.to_ne_bytes();
-    let mut val_buf = [0u8; 24];
-    val_buf[0..4].copy_from_slice(&d.prio.to_ne_bytes());
-    val_buf[4] = d.cpu_kind;
-    val_buf[5] = d.cpu_prefer;
-    val_buf[8..16].copy_from_slice(&d.slice_ns.to_ne_bytes());
-    val_buf[16..24].copy_from_slice(&d.expt_wait.to_ne_bytes());
-    update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
-    Ok(())
-}
-
 fn thread_cpu_time() -> Duration {
     #[repr(C)]
     struct Timespec { tv_sec: i64, tv_nsec: i64 }
@@ -602,7 +584,7 @@ fn run_classify_cycle(
             }
         }
 
-        let Some(decision) = set.predict(&mut ts) else {
+        let Some(decision) = set.predict(tid, &mut ts, update_map)? else {
             continue;
         };
         predict_count += 1;
@@ -616,8 +598,6 @@ fn run_classify_cycle(
             cpu_prefer: decision.cpu_prefer,
             is_target,
         });
-
-        write_sched_info(update_map, tid, &decision)?;
     }
 
     // Publish the snapshot for the GUI. Done before the timing log so the
@@ -797,7 +777,7 @@ fn main() -> Result<()> {
 
     // Give it the highest priority (0) so it is never starved by its own policy
     let own_tid = own_tid();
-    write_sched_info(update_map, own_tid, &SchedDecision {
+    predictor::write_sched_info(update_map, own_tid, &SchedDecision {
         prio: 0,
         cpu_kind: 0,
         cpu_prefer: CPU_SLOW_PREFER,

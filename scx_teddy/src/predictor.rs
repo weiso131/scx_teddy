@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::fs;
+use libbpf_rs::{MapCore, MapFlags};
 use crate::predictors::kmeans::{KMeansCollector, KMeansModel, KMeansPredictor};
 use crate::task_stats::TaskStats;
 
@@ -18,12 +19,39 @@ pub struct SchedDecision {
     pub expt_wait: u64,
 }
 
+/// Pack a `sched_info_t {prio: s32, kind: u8, cpu_prefer: u8, slice: u64,
+/// expt_wait: u64}` and write it into `update_map` for `tid`. Predictors call
+/// this from `predict` to push a decision down to BPF.
+pub fn write_sched_info(
+    update_map: &libbpf_rs::Map,
+    tid: i32,
+    d: &SchedDecision,
+) -> Result<()> {
+    let tid_key = tid.to_ne_bytes();
+    let mut val_buf = [0u8; 24];
+    val_buf[0..4].copy_from_slice(&d.prio.to_ne_bytes());
+    val_buf[4] = d.cpu_kind;
+    val_buf[5] = d.cpu_prefer;
+    val_buf[8..16].copy_from_slice(&d.slice_ns.to_ne_bytes());
+    val_buf[16..24].copy_from_slice(&d.expt_wait.to_ne_bytes());
+    update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
+    Ok(())
+}
+
 pub trait Predictor: Send + Sync {
-    /// Decide the scheduling parameters for a task. The predictor owns its
-    /// config, so it maps the task's stats all the way to a `SchedDecision`.
-    /// It decides which fields it reads and whether to consume `need_update`.
-    /// Returns None when there is nothing to do this cycle.
-    fn predict(&self, stats: &mut TaskStats) -> Option<SchedDecision>;
+    /// Decide the scheduling parameters for `tid` and push them to BPF. The
+    /// predictor owns its config, so it maps the task's stats all the way to a
+    /// `SchedDecision` and writes it into `update_map` itself (via
+    /// `write_sched_info`) — this lets an experiment-driven predictor control
+    /// exactly what and when it writes. It decides which fields it reads and
+    /// whether to consume `need_update`. The returned decision is what was
+    /// written, for the caller's snapshot; `None` means nothing to do this cycle.
+    fn predict(
+        &self,
+        tid: i32,
+        stats: &mut TaskStats,
+        update_map: &libbpf_rs::Map,
+    ) -> Result<Option<SchedDecision>>;
 
     /// Number of output categories (clusters or classes).
     fn n_outputs(&self) -> usize;

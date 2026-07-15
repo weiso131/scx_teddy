@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
-use crate::predictor::{Collector, Predictor, SchedDecision};
+use crate::predictor::{Collector, Predictor, SchedDecision, write_sched_info};
 use crate::task_stats::TaskStats;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -210,9 +210,14 @@ impl KMeansPredictor {
 }
 
 impl Predictor for KMeansPredictor {
-    fn predict(&self, stats: &mut TaskStats) -> Option<SchedDecision> {
+    fn predict(
+        &self,
+        tid: i32,
+        stats: &mut TaskStats,
+        update_map: &libbpf_rs::Map,
+    ) -> Result<Option<SchedDecision>> {
         if stats.need_update == 0 {
-            return None;
+            return Ok(None);
         }
         stats.need_update = 0;
 
@@ -224,14 +229,16 @@ impl Predictor for KMeansPredictor {
             .get(&cluster.to_string())
             .unwrap_or(&self.config.default);
 
-        Some(SchedDecision {
+        let decision = SchedDecision {
             cluster,
             prio: cluster_cfg.prio,
             cpu_kind: cluster_cfg.cpu_kind,
             cpu_prefer: cluster_cfg.cpu_prefer,
             slice_ns: cluster_cfg.compute_slice_ns(&named_stats),
             expt_wait: 0,
-        })
+        };
+        write_sched_info(update_map, tid, &decision)?;
+        Ok(Some(decision))
     }
 
     fn n_outputs(&self) -> usize {
