@@ -37,7 +37,7 @@ const WARMUP: Duration = Duration::from_secs(30);
 
 /// First injected delay of an experiment; it doubles from here.
 const EXPT_WAIT_START: u64 = 1000; // ns
-const MAX_WAIT_MULTIPLE: i32 = 20; // 1 << 20
+const MAX_WAIT_MULTIPLE: i32 = 21; // 1000 << 20 ≈ 1.049s
 /// How many before/delayed/after rounds to run per `expt_wait` value.
 const EXPT_ROUNDS: u32 = 5;
 /// How many of those rounds must look worse for the value to count as "bad".
@@ -192,7 +192,9 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle) {
         };
         eprintln!("[expt] start cluster {cluster}");
 
-        // Grow expt_wait until a value looks bad.
+        // Grow expt_wait until a value looks bad, or until we hit the cap. The
+        // cap bounds the injected delay so a task with no tolerable limit never
+        // gets so much delay that sched-ext tears the scheduler down.
         let mut expt_wait = EXPT_WAIT_START;
         for _ in 0..MAX_WAIT_MULTIPLE {
             let mut bad = 0;
@@ -220,15 +222,10 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle) {
                 }
             }
 
+            // A bad value ends the search: good_expt_wait already holds the last
+            // OK value. Otherwise record this value as good and double it.
             if bad >= EXPT_BAD_THRESHOLD {
                 eprintln!("[expt] cluster {cluster}: expt_wait={expt_wait} bad ({bad}/{EXPT_ROUNDS}) -> done");
-                let mut st = state.lock().unwrap();
-                if let Some(c) = st.clusters.get_mut(cluster) {
-                    c.done = true; // good_expt_wait already holds the last good value
-                }
-                st.expt_cluster = None;
-                st.cur_params = None;
-                st.expt_tids.clear();
                 break;
             }
 
@@ -238,6 +235,17 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle) {
             }
             expt_wait = expt_wait.saturating_mul(2);
         }
+
+        // The cluster's search is over whether it ended on a bad value or ran
+        // out of room at the cap — either way mark it done and release the tids
+        // so they go back to being scheduled by `predict`.
+        let mut st = state.lock().unwrap();
+        if let Some(c) = st.clusters.get_mut(cluster) {
+            c.done = true; // good_expt_wait holds the last OK value (0 if none)
+        }
+        st.expt_cluster = None;
+        st.cur_params = None;
+        st.expt_tids.clear();
     }
 }
 
