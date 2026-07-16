@@ -35,40 +35,209 @@ use crate::task_stats::TaskStats;
 /// for this long so the classification has settled. Constant for now.
 const WARMUP: Duration = Duration::from_secs(30);
 
+/// First injected delay of an experiment; it doubles from here.
+const EXPT_WAIT_START: u64 = 1000; // ns
+const MAX_WAIT_MULTIPLE: i32 = 20; // 1 << 20
+/// How many before/delayed/after rounds to run per `expt_wait` value.
+const EXPT_ROUNDS: u32 = 5;
+/// How many of those rounds must look worse for the value to count as "bad".
+const EXPT_BAD_THRESHOLD: u32 = 3;
+/// Fixed slice used while experimenting when the cluster's config is adaptive:
+/// the experiment thread has no per-task stats to compute an adaptive slice.
+const EXPT_FIXED_SLICE_NS: u64 = 100 * 1000; // 100us, mirrors DEFAULT_SLICE
+
+/// Per-cluster experiment progress. Index into `ExptState::clusters` is the
+/// cluster id.
+#[derive(Clone)]
+struct ClusterExpt {
+    /// Running sum of `ln(runtime_ratio)` and its count. Their quotient is the
+    /// log-domain mean of runtime_ratio; since `exp` is monotonic we compare
+    /// clusters on the quotient directly and never convert back. Accumulated
+    /// across cycles (not reset) for now.
+    ln_sum: f64,
+    count: u64,
+    /// The largest `expt_wait` that still measured OK; the tolerable delay found
+    /// so far. 0 until the first good value.
+    good_expt_wait: u64,
+    /// Whether this cluster's search has finished.
+    done: bool,
+}
+
+impl ClusterExpt {
+    fn new() -> Self {
+        Self { ln_sum: 0.0, count: 0, good_expt_wait: 0, done: false }
+    }
+
+    /// Ordering key for cluster selection: the log-domain mean of runtime_ratio.
+    /// Monotonic in the geometric mean, so it ranks clusters without the `exp`.
+    /// `NEG_INFINITY` when there are no samples, so such clusters sort last.
+    fn ratio_rank(&self) -> f64 {
+        if self.count == 0 { f64::NEG_INFINITY } else { self.ln_sum / self.count as f64 }
+    }
+}
+
+/// The scheduling parameters the experiment thread writes for the tids under
+/// test — a snapshot of the cluster-under-test's config, minus `expt_wait`
+/// (which the experiment sets/clears itself). Slice is fixed here: the
+/// experiment thread has no per-task stats to recompute an adaptive slice.
+#[derive(Clone)]
+struct ExptParams {
+    prio: i32,
+    cpu_kind: u8,
+    cpu_prefer: u8,
+    slice_ns: u64,
+}
+
 /// State shared between the classify thread (`predict`) and the experiment
-/// thread. The experiment thread owns the search; `predict` only feeds it tids.
+/// thread. The experiment thread owns the search; `predict` only feeds it tids
+/// and accumulates the runtime_ratio stats.
 struct ExptState {
     /// The cluster currently under experiment. `None` before one is picked.
     expt_cluster: Option<usize>,
+    /// Config snapshot of the cluster under test, for the experiment thread to
+    /// write. Set together with `expt_cluster`.
+    cur_params: Option<ExptParams>,
     /// Tids classified into `expt_cluster`, handed to the experiment thread.
     /// `predict` inserts; the experiment thread reads (and clears when it moves
     /// on to the next cluster).
     expt_tids: HashSet<i32>,
+    /// Per-cluster experiment progress, indexed by cluster id.
+    clusters: Vec<ClusterExpt>,
+    /// Per-cluster scheduling params, snapshotted from config at startup. The
+    /// experiment thread reads these when it picks a cluster (config lives on
+    /// the classify thread, so it is copied here once).
+    cluster_params: Vec<ExptParams>,
 }
 
 impl ExptState {
-    fn new() -> Self {
-        Self { expt_cluster: None, expt_tids: HashSet::new() }
+    fn new(cluster_params: Vec<ExptParams>) -> Self {
+        let n_clusters = cluster_params.len();
+        Self {
+            expt_cluster: None,
+            cur_params: None,
+            expt_tids: HashSet::new(),
+            clusters: vec![ClusterExpt::new(); n_clusters],
+            cluster_params,
+        }
+    }
+
+    /// Pick the not-yet-done cluster with the highest runtime_ratio rank.
+    /// Returns None when every remaining cluster is done or unsampled.
+    fn pick_cluster(&self) -> Option<usize> {
+        self.clusters
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.done && c.count > 0)
+            .max_by(|(_, a), (_, b)| {
+                a.ratio_rank().partial_cmp(&b.ratio_rank())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+    }
+
+    /// The scheduling params to drive `cluster` with during its experiment.
+    fn cur_params_for(&self, cluster: usize) -> ExptParams {
+        self.cluster_params[cluster].clone()
     }
 }
 
-/// The experiment thread. Skeleton for now: each round just measures one metric
-/// window. `measure` blocks (~1s) inside the layer, which paces the loop — no
-/// sleep needed — and it runs without the lock held so `predict` can keep
-/// feeding tids meanwhile. Later this will drive the tids in `expt_tids` with
-/// `write_sched_info` using the current `expt_wait`, compare metric samples,
-/// grow `expt_wait`, and advance to the next cluster.
-fn experiment_loop(state: Arc<Mutex<ExptState>>, _map: MapHandle) {
+/// Write `expt_wait` (with the cluster-under-test's params) to every tid in
+/// `expt_tids`. Snapshots the tid set under the lock, then writes without it
+/// held so `predict` is not blocked during the map updates.
+fn drive_tids(state: &Arc<Mutex<ExptState>>, map: &MapHandle, expt_wait: u64) {
+    let (tids, params) = {
+        let st = state.lock().unwrap();
+        match &st.cur_params {
+            Some(p) => (st.expt_tids.iter().copied().collect::<Vec<_>>(), p.clone()),
+            None => return,
+        }
+    };
+    for tid in tids {
+        let decision = SchedDecision {
+            cluster: 0, // unused by write_sched_info
+            prio: params.prio,
+            cpu_kind: params.cpu_kind,
+            cpu_prefer: params.cpu_prefer,
+            slice_ns: params.slice_ns,
+            expt_wait,
+        };
+        if let Err(e) = write_sched_info(map, tid, &decision) {
+            eprintln!("[expt] write_sched_info(tid={tid}) failed: {e}");
+        }
+    }
+}
+
+/// The experiment thread. Picks one cluster at a time (highest runtime_ratio
+/// rank), then grows `expt_wait` from `EXPT_WAIT_START`, doubling each step,
+/// until a value looks bad — that ends the cluster's search. Each value is
+/// judged over `EXPT_ROUNDS` before/delayed/after rounds. `measure` blocks
+/// (~1s) inside the layer, which paces the loop; it runs without the lock held
+/// so `predict` can keep feeding tids meanwhile.
+fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle) {
     eprintln!("[expt] experiment thread started");
     loop {
-        match GameFps::measure() {
-            Ok(s) => eprintln!("[expt] fps={:.1} (frames={})", s.fps, s.frame_count),
-            Err(e) => eprintln!("[expt] measure failed: {e}"),
-        }
+        // Pick the next cluster to experiment on. When every cluster is done
+        // there is nothing left to drive, so the thread just exits.
+        let cluster = {
+            let mut st = state.lock().unwrap();
+            let Some(cluster) = st.pick_cluster() else {
+                eprintln!("[expt] all clusters done, experiment thread exiting");
+                return;
+            };
+            let params = st.cur_params_for(cluster);
+            st.expt_cluster = Some(cluster);
+            st.cur_params = Some(params);
+            st.expt_tids.clear();
+            cluster
+        };
+        eprintln!("[expt] start cluster {cluster}");
 
-        let _guard = state.lock().unwrap();
-        // TODO: pick expt_cluster by highest avg runtime_ratio, drive expt_tids,
-        // compare samples, grow expt_wait, advance to the next cluster.
+        // Grow expt_wait until a value looks bad.
+        let mut expt_wait = EXPT_WAIT_START;
+        for _ in 0..MAX_WAIT_MULTIPLE {
+            let mut bad = 0;
+            for _ in 0..EXPT_ROUNDS {
+                // `measure` only errors while first mapping the shm; once that
+                // succeeds it always returns `Ok`
+                let before = GameFps::measure().expect("measure (before) failed after warm-up");
+                drive_tids(&state, &map, expt_wait);
+                let delayed = GameFps::measure().expect("measure (delayed) failed after warm-up");
+                drive_tids(&state, &map, 0);
+                let after = GameFps::measure().expect("measure (after) failed after warm-up");
+
+                // Bad if the delayed sample is worse than both undelayed ones.
+                if delayed.compare(&before) == std::cmp::Ordering::Less
+                    && delayed.compare(&after) == std::cmp::Ordering::Less
+                {
+                    bad += 1;
+                    // `compare` ranks purely on fps, so print all three fps to
+                    // see whether delayed really dropped or the game just jittered.
+                    eprintln!(
+                        "[expt] cluster {cluster}: expt_wait={expt_wait} bad round: \
+                         before_fps={:.1} delayed_fps={:.1} after_fps={:.1}",
+                        before.fps, delayed.fps, after.fps
+                    );
+                }
+            }
+
+            if bad >= EXPT_BAD_THRESHOLD {
+                eprintln!("[expt] cluster {cluster}: expt_wait={expt_wait} bad ({bad}/{EXPT_ROUNDS}) -> done");
+                let mut st = state.lock().unwrap();
+                if let Some(c) = st.clusters.get_mut(cluster) {
+                    c.done = true; // good_expt_wait already holds the last good value
+                }
+                st.expt_cluster = None;
+                st.cur_params = None;
+                st.expt_tids.clear();
+                break;
+            }
+
+            eprintln!("[expt] cluster {cluster}: expt_wait={expt_wait} ok, doubling");
+            if let Some(c) = state.lock().unwrap().clusters.get_mut(cluster) {
+                c.good_expt_wait = expt_wait;
+            }
+            expt_wait = expt_wait.saturating_mul(2);
+        }
     }
 }
 
@@ -125,6 +294,21 @@ impl ClusterSchedConfig {
                 (slice.max(1000.0)) as u64 // at least 1us
             }
             SliceConfig::Fixed { slice_ns } => *slice_ns,
+        }
+    }
+
+    /// Snapshot this cluster's params for the experiment thread. An adaptive
+    /// slice has no per-task stats here, so it falls back to a fixed slice.
+    fn to_expt_params(&self) -> ExptParams {
+        let slice_ns = match &self.slice {
+            SliceConfig::Adaptive { .. } => EXPT_FIXED_SLICE_NS,
+            SliceConfig::Fixed { slice_ns } => *slice_ns,
+        };
+        ExptParams {
+            prio: self.prio,
+            cpu_kind: self.cpu_kind,
+            cpu_prefer: self.cpu_prefer,
+            slice_ns,
         }
     }
 }
@@ -237,6 +421,17 @@ impl ExptTolerancePredictor {
         let config: SchedConfig = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse config: {}", config_path))?;
 
+        // Snapshot each cluster's params for the experiment thread (config lives
+        // on the classify thread). An unknown cluster falls back to `default`.
+        let cluster_params: Vec<ExptParams> = (0..model.n_clusters)
+            .map(|c| {
+                config.clusters
+                    .get(&c.to_string())
+                    .unwrap_or(&config.default)
+                    .to_expt_params()
+            })
+            .collect();
+
         Ok(Self {
             n_clusters: model.n_clusters,
             feature_indices,
@@ -246,13 +441,13 @@ impl ExptTolerancePredictor {
             config,
             start: Instant::now(),
             spawned: AtomicBool::new(false),
-            state: Arc::new(Mutex::new(ExptState::new())),
+            state: Arc::new(Mutex::new(ExptState::new(cluster_params))),
         })
     }
 
     /// After the warm-up, spawn the experiment thread exactly once. Called from
     /// `predict`, where `update_map` is available to clone into an owned handle
-    /// the thread can keep. `expt_cluster` is hardcoded to 0 for now.
+    /// the thread can keep. The thread picks which cluster to experiment on.
     fn maybe_spawn_experiment(&self, update_map: &libbpf_rs::Map) -> Result<()> {
         if self.start.elapsed() < WARMUP {
             return Ok(());
@@ -262,12 +457,10 @@ impl ExptTolerancePredictor {
             return Ok(());
         }
 
-        self.state.lock().unwrap().expt_cluster = Some(0);
-
         let map = MapHandle::try_from(update_map)
             .context("Failed to clone update_map for the experiment thread")?;
         let state = Arc::clone(&self.state);
-        eprintln!("[expt] warm-up done, spawning experiment thread (expt_cluster=0)");
+        eprintln!("[expt] warm-up done, spawning experiment thread");
         std::thread::spawn(move || experiment_loop(state, map));
         Ok(())
     }
@@ -342,11 +535,25 @@ impl Predictor for ExptTolerancePredictor {
             expt_wait: 0,
         };
 
-        // Tasks of the cluster under experiment are handed to the experiment
-        // thread instead of being written here. The lock is held only long
-        // enough to check the cluster and record the tid.
+        let runtime_ratio = named_stats
+            .iter()
+            .find(|(n, _)| *n == "runtime_ratio")
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0);
+
+        // Accumulate the cluster's runtime_ratio (for cluster selection) and, if
+        // this is the cluster under experiment, hand the tid to the experiment
+        // thread instead of writing it here. The lock is held only long enough
+        // to update the shared state.
         let handed_off = {
             let mut st = self.state.lock().unwrap();
+            if let Some(c) = st.clusters.get_mut(cluster) {
+                // ln(0) would poison the mean, so only count positive ratios.
+                if runtime_ratio > 0.0 {
+                    c.ln_sum += runtime_ratio.ln();
+                    c.count += 1;
+                }
+            }
             if st.expt_cluster == Some(cluster) {
                 st.expt_tids.insert(tid);
                 true
