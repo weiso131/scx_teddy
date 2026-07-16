@@ -34,6 +34,8 @@ struct FpsShm {
     frame_count: u64,
 }
 
+const FPS_EPS: f64 = 0.02;
+
 /// One measured window of game rendering.
 #[derive(Debug, Clone)]
 pub struct GameFps {
@@ -134,8 +136,23 @@ impl Metric for GameFps {
     }
 
     /// Higher FPS is better, so `Less` means this sample rendered worse.
-    /// A NaN on either side is reported as indistinguishable.
+    /// Differences within `FPS_EPS` (relative) are treated as `Equal` so the
+    /// game's own jitter is not mistaken for a delay-induced regression. NaN on
+    /// either side is reported as indistinguishable.
     fn compare(&self, other: &Self) -> Ordering {
-        self.fps.partial_cmp(&other.fps).unwrap_or(Ordering::Equal)
+        let (a, b) = (self.fps, other.fps);
+        if a.is_nan() || b.is_nan() {
+            return Ordering::Equal;
+        }
+        // Relative tolerance against the larger magnitude, so the threshold
+        // scales with the fps level rather than being a fixed absolute gap.
+        let tol = FPS_EPS * a.abs().max(b.abs());
+        if (a - b).abs() <= tol {
+            Ordering::Equal
+        } else if a < b {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }
     }
 }
