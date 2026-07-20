@@ -149,6 +149,19 @@ struct {
     __type(value, sched_info_t);
 } update_map SEC(".maps");
 
+/* Per-tid scheduling-delay EWMA, exposed to userspace off the ringbuf hot path.
+ * key = tid, value = sched_delay_ewma (ns). Written under the same throttle as
+ * the ringbuf event (see try_data_to_user); the value is a single aligned u64,
+ * so a userspace lookup copies it out without tearing — no lock needed. Lets the
+ * expt_tolerance experiment loop read a task's real delay directly instead of
+ * waiting for a ringbuf event. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256 * 1024);
+    __type(key, s32);
+    __type(value, u64);
+} sched_delay_map SEC(".maps");
+
 static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
 {
     u32 key = CONFIG_STOP_RINGBUF;
@@ -163,6 +176,12 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     if (now - target_ctx->last_send_time < MIN_SEND_INTERVAL)
         return;
     target_ctx->last_send_time = now;
+
+    /* Publish the current delay EWMA for userspace to read directly (off the
+     * ringbuf path). Same throttle as the event below. */
+    s32 delay_key = p->pid;
+    u64 delay = target_ctx->sched_delay_ewma;
+    bpf_map_update_elem(&sched_delay_map, &delay_key, &delay, BPF_ANY);
 
     task_event_t *e = bpf_ringbuf_reserve(&events, sizeof(task_event_t), 0);
     if (!e) {
@@ -181,8 +200,6 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     e->sleep_cnt = target_ctx->sleep_cnt;
     e->in_iowait_cnt = target_ctx->in_iowait_cnt;
     e->futex_wait_cnt = target_ctx->futex_wait_cnt;
-    /* Current EWMA value, not an accumulator: sent as-is and never reset. */
-    e->sched_delay_ewma = target_ctx->sched_delay_ewma;
 
     // Submit to ring buffer
     bpf_ringbuf_submit(e, 0);
@@ -568,6 +585,9 @@ void BPF_STRUCT_OPS(teddy_exit_task, struct task_struct *p, struct scx_exit_task
 
     bpf_ringbuf_submit(e, 0);
 clear_tracing_data:
+    /* Drop the task's delay entry so a recycled tid never reads a stale value. */
+    pid_t delay_key = p->pid;
+    bpf_map_delete_elem(&sched_delay_map, &delay_key);
 }
 
 /* Scheduler exit - record exit info */

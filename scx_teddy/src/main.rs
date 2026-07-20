@@ -442,6 +442,7 @@ fn poll_target_set(
     last_model: &mut String,
     last_config: &mut String,
     cpu_kind_num: u8,
+    sched_delay_map: &libbpf_rs::Map,
     logger: &Rc<RefCell<Logger>>,
 ) -> Option<SchedSet> {
     let m = read_control_path(CONTROL_MODEL_PATH);
@@ -462,6 +463,7 @@ fn poll_target_set(
     match load_sched_set(&m, &c) {
         Ok(set) => match set.validate(cpu_kind_num) {
             Ok(()) => {
+                set.attach_sched_delay_map(sched_delay_map);
                 log!(logger, "control: target set -> {} + {}", m, c);
                 Some(set)
             }
@@ -772,6 +774,16 @@ fn main() -> Result<()> {
 
     let scheduler_config = &skel.maps.scheduler_config;
     let update_map = &skel.maps.update_map;
+    let sched_delay_map = &skel.maps.sched_delay_map;
+
+    // Hand the per-tid delay map to the startup sets now that it exists. A
+    // reloaded target set is given its own copy in poll_target_set.
+    if let Some(set) = &default_set {
+        set.attach_sched_delay_map(sched_delay_map);
+    }
+    if let Some(set) = &target_set {
+        set.attach_sched_delay_map(sched_delay_map);
+    }
 
     log!(logger, "scx_teddy scheduler loaded successfully!");
 
@@ -834,7 +846,7 @@ fn main() -> Result<()> {
             if args.mode == "classify" {
                 target_set = poll_target_set(
                     target_set, &mut last_target_model, &mut last_target_config,
-                    topo.cpu_kind_num, &logger);
+                    topo.cpu_kind_num, sched_delay_map, &logger);
             }
             last_control_check = Instant::now();
         }

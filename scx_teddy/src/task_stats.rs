@@ -7,7 +7,6 @@ pub struct TaskEvent {
     pub sleep_sq_sum: u64,
     pub runtime_sum: u64,
     pub runtime_sq_sum: u64,
-    pub sched_delay_ewma: u64,
     pub sleep_cnt: u32,
     pub in_iowait_cnt: u32,
     pub futex_wait_cnt: u32
@@ -26,10 +25,6 @@ pub struct TaskStats {
 
     pub in_iowait_cnt: u64,
     pub futex_wait_cnt: u64,
-
-    /// Current scheduling-delay EWMA in ns, as maintained by BPF. Unlike the
-    /// other stats this is a value, not an accumulator — each event overwrites it.
-    pub sched_delay_ewma: u64,
 
     pub event_count: u64,
     /// Union-Find ancestor pointer toward the specialization root.
@@ -74,8 +69,6 @@ impl TaskStats {
             in_iowait_cnt: 0,
             futex_wait_cnt: 0,
 
-            sched_delay_ewma: 0,
-
             event_count: 0,
             ancestor,
             real_ppid: ancestor,
@@ -100,9 +93,6 @@ impl TaskStats {
         
         self.in_iowait_cnt += event.in_iowait_cnt as u64;
         self.futex_wait_cnt += event.futex_wait_cnt as u64;
-
-        // A value, not an accumulator: BPF maintains the EWMA, we mirror it.
-        self.sched_delay_ewma = event.sched_delay_ewma;
     }
 
     pub fn avg_runtime_ms(&self) -> f64 {
@@ -189,7 +179,6 @@ mod tests {
             sleep_sq_sum: 0,
             in_iowait_cnt: 0,
             futex_wait_cnt: 0,
-            sched_delay_ewma: 0,
         };
         stats.update(&event);
         
@@ -226,7 +215,6 @@ mod tests {
                 sleep_sq_sum: 0,
                 in_iowait_cnt: 0,
                 futex_wait_cnt: 0,
-                sched_delay_ewma: 0,
             });
         }
 
@@ -256,7 +244,6 @@ mod tests {
                                       // Let's re-check the update_event_data in BPF
             in_iowait_cnt: 0,
             futex_wait_cnt: 0,
-            sched_delay_ewma: 0,
         };
         // In BPF: sleep_mus = (target_ctx->sleep_end - target_ctx->sleep_start) >> 10;
         // target_ctx->sleep_sum += sleep_mus;

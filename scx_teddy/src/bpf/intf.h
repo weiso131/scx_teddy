@@ -99,7 +99,6 @@ typedef struct task_event {
     u64 sleep_sq_sum;
     u64 runtime_sum;
     u64 runtime_sq_sum;
-    u64 sched_delay_ewma; // ns, current value (not accumulated/reset)
     u32 sleep_cnt;
     u32 in_iowait_cnt;
     u32 futex_wait_cnt;

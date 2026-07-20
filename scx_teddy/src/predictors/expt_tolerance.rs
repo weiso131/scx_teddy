@@ -20,7 +20,7 @@ mod metric;
 mod metrics;
 
 use anyhow::{Context, Result};
-use libbpf_rs::MapHandle;
+use libbpf_rs::{MapCore, MapFlags, MapHandle};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -174,7 +174,34 @@ fn drive_tids(state: &Arc<Mutex<ExptState>>, map: &MapHandle, expt_wait: u64) {
 /// judged over `EXPT_ROUNDS` before/delayed/after rounds. `measure` blocks
 /// (~1s) inside the layer, which paces the loop; it runs without the lock held
 /// so `predict` can keep feeding tids meanwhile.
-fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle) {
+/// Mean sched-delay EWMA (ns) over the current cluster's tids, read live from
+/// the BPF `sched_delay_map`. Tids with no entry yet (never published) or a zero
+/// EWMA are skipped. Returns None when no tid has a usable value — the caller
+/// then falls back to the fixed start delay.
+fn cluster_mean_delay(state: &Arc<Mutex<ExptState>>, delay_map: &MapHandle) -> Option<u64> {
+    let tids: Vec<i32> = {
+        let st = state.lock().unwrap();
+        st.expt_tids.iter().copied().collect()
+    };
+    let mut sum: u128 = 0;
+    let mut n: u64 = 0;
+    for tid in tids {
+        let key = tid.to_ne_bytes();
+        // lookup copies the 8-byte value out atomically (single aligned u64).
+        if let Ok(Some(val)) = delay_map.lookup(&key, MapFlags::ANY) {
+            if val.len() == 8 {
+                let d = u64::from_ne_bytes(val[..8].try_into().unwrap());
+                if d > 0 {
+                    sum += d as u128;
+                    n += 1;
+                }
+            }
+        }
+    }
+    if n == 0 { None } else { Some((sum / n as u128) as u64) }
+}
+
+fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle, delay_map: MapHandle) {
     eprintln!("[expt] experiment thread started");
     loop {
         // Pick the next cluster to experiment on. When every cluster is done
@@ -193,6 +220,10 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle) {
         };
         eprintln!("[expt] start cluster {cluster}");
 
+        // predict refills expt_tids on its next cycle; wait one so the first
+        // delay read sees the cluster's tids instead of an empty set.
+        std::thread::sleep(Duration::from_secs(1));
+
         // Grow expt_wait until a value looks bad, or until we hit the cap. The
         // cap bounds the injected delay so a task with no tolerable limit never
         // gets so much delay that sched-ext tears the scheduler down.
@@ -205,8 +236,16 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle) {
                 let before = GameFps::measure().expect("measure (before) failed after warm-up");
                 drive_tids(&state, &map, expt_wait);
                 let delayed = GameFps::measure().expect("measure (delayed) failed after warm-up");
+                // Real scheduling delay under this injected wait — may exceed
+                // expt_wait if injecting it cascades into queueing.
+                let real_delay = cluster_mean_delay(&state, &delay_map);
                 drive_tids(&state, &map, 0);
                 let after = GameFps::measure().expect("measure (after) failed after warm-up");
+
+                eprintln!(
+                    "[expt] cluster {cluster}: expt_wait={expt_wait} real_delay={} ns",
+                    real_delay.map_or("n/a".to_string(), |d| d.to_string())
+                );
 
                 // Bad if the delayed sample is worse than both undelayed ones.
                 if delayed.compare(&before) == std::cmp::Ordering::Less
@@ -336,6 +375,10 @@ pub struct ExptTolerancePredictor {
     spawned: AtomicBool,
     /// Shared with the experiment thread (see `ExptState`).
     state: Arc<Mutex<ExptState>>,
+    /// Owned handle to the BPF per-tid delay-EWMA map, set by
+    /// `attach_sched_delay_map` after the skeleton loads and handed to the
+    /// experiment thread when it spawns. `None` until then.
+    sched_delay_map: Mutex<Option<MapHandle>>,
 }
 
 impl ExptTolerancePredictor {
@@ -363,6 +406,7 @@ impl ExptTolerancePredictor {
             start: Instant::now(),
             spawned: AtomicBool::new(false),
             state: Arc::new(Mutex::new(ExptState::new(cluster_params))),
+            sched_delay_map: Mutex::new(None),
         })
     }
 
@@ -380,9 +424,14 @@ impl ExptTolerancePredictor {
 
         let map = MapHandle::try_from(update_map)
             .context("Failed to clone update_map for the experiment thread")?;
+        // Take the delay-map handle attached after load. It must be present by
+        // now: attach_sched_delay_map runs right after the skeleton loads, long
+        // before the warm-up that gates this spawn elapses.
+        let delay_map = self.sched_delay_map.lock().unwrap().take()
+            .context("sched_delay_map was never attached before the experiment spawned")?;
         let state = Arc::clone(&self.state);
         eprintln!("[expt] warm-up done, spawning experiment thread");
-        std::thread::spawn(move || experiment_loop(state, map));
+        std::thread::spawn(move || experiment_loop(state, map, delay_map));
         Ok(())
     }
 }
@@ -448,6 +497,15 @@ impl Predictor for ExptTolerancePredictor {
             write_sched_info(update_map, tid, &decision)?;
         }
         Ok(Some(decision))
+    }
+
+    fn attach_sched_delay_map(&self, map: &libbpf_rs::Map) {
+        match MapHandle::try_from(map) {
+            Ok(handle) => *self.sched_delay_map.lock().unwrap() = Some(handle),
+            // Only logged: the experiment thread's take() will surface a hard
+            // error if it spawns without a handle, so a failure here isn't silent.
+            Err(e) => eprintln!("[expt] failed to clone sched_delay_map: {e}"),
+        }
     }
 
     fn n_outputs(&self) -> usize {
