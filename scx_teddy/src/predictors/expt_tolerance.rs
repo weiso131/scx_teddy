@@ -9,10 +9,11 @@
 //!
 //! Threading. `predict` runs on the main classify thread. Once the warm-up has
 //! elapsed it spawns a single, detached experiment thread. The two share
-//! `ExptState` behind a mutex: `predict` routes tasks of the cluster under test
-//! into `expt_tids` instead of writing their schedule itself, and the experiment
-//! thread drives those tids. The experiment thread only ever touches `ExptState`
-//! and its own owned `MapHandle` — never the classify thread's stats map.
+//! `ExptState` behind a mutex: `predict` records each cluster's membership and
+//! leaves the schedule of the cluster under test to the experiment thread,
+//! which drives that cluster's tids. The experiment thread only touches
+//! `ExptState` and its own owned `MapHandle` — never the classify thread's
+//! stats map.
 //! `expt_wait` stays 0 until the experiment sets a delay, so before then tasks
 //! are scheduled purely by priority.
 
@@ -49,7 +50,6 @@ const EXPT_FIXED_SLICE_NS: u64 = 100 * 1000; // 100us, mirrors DEFAULT_SLICE
 
 /// Per-cluster experiment progress. Index into `ExptState::clusters` is the
 /// cluster id.
-#[derive(Clone)]
 struct ClusterExpt {
     /// Running sum of `ln(runtime_ratio)` and its count. Their quotient is the
     /// log-domain mean of runtime_ratio; since `exp` is monotonic we compare
@@ -57,6 +57,13 @@ struct ClusterExpt {
     /// across cycles (not reset) for now.
     ln_sum: f64,
     count: u64,
+    /// Every tid classified into this cluster so far. Accumulated across cycles
+    /// and never cleared, so when the experiment thread reaches this cluster it
+    /// gets the full membership instead of only the tasks that happened to wake
+    /// since the switch — long-period tasks used to be missing from a cluster's
+    /// early rounds. `predict` only touches this on a cluster transition (see
+    /// `TaskStats::last_cluster`).
+    tids: HashSet<i32>,
     /// The largest `expt_wait` that still measured OK; the tolerable delay found
     /// so far. 0 until the first good value.
     good_expt_wait: u64,
@@ -66,7 +73,7 @@ struct ClusterExpt {
 
 impl ClusterExpt {
     fn new() -> Self {
-        Self { ln_sum: 0.0, count: 0, good_expt_wait: 0, done: false }
+        Self { ln_sum: 0.0, count: 0, tids: HashSet::new(), good_expt_wait: 0, done: false }
     }
 
     /// Ordering key for cluster selection: the log-domain mean of runtime_ratio.
@@ -98,11 +105,7 @@ struct ExptState {
     /// Config snapshot of the cluster under test, for the experiment thread to
     /// write. Set together with `expt_cluster`.
     cur_params: Option<ExptParams>,
-    /// Tids classified into `expt_cluster`, handed to the experiment thread.
-    /// `predict` inserts; the experiment thread reads (and clears when it moves
-    /// on to the next cluster).
-    expt_tids: HashSet<i32>,
-    /// Per-cluster experiment progress, indexed by cluster id.
+    /// Per-cluster experiment progress and membership, indexed by cluster id.
     clusters: Vec<ClusterExpt>,
     /// Per-cluster scheduling params, snapshotted from config at startup. The
     /// experiment thread reads these when it picks a cluster (config lives on
@@ -116,10 +119,18 @@ impl ExptState {
         Self {
             expt_cluster: None,
             cur_params: None,
-            expt_tids: HashSet::new(),
-            clusters: vec![ClusterExpt::new(); n_clusters],
+            clusters: (0..n_clusters).map(|_| ClusterExpt::new()).collect(),
             cluster_params,
         }
+    }
+
+    /// Snapshot of the tids in the cluster currently under test. Empty when no
+    /// cluster is under test.
+    fn expt_tids(&self) -> Vec<i32> {
+        self.expt_cluster
+            .and_then(|c| self.clusters.get(c))
+            .map(|c| c.tids.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Pick the not-yet-done cluster with the highest runtime_ratio rank.
@@ -142,14 +153,14 @@ impl ExptState {
     }
 }
 
-/// Write `expt_wait` (with the cluster-under-test's params) to every tid in
-/// `expt_tids`. Snapshots the tid set under the lock, then writes without it
-/// held so `predict` is not blocked during the map updates.
+/// Write `expt_wait` (with the cluster-under-test's params) to every tid in the
+/// cluster under test. Snapshots the tid set under the lock, then writes without
+/// it held so `predict` is not blocked during the map updates.
 fn drive_tids(state: &Arc<Mutex<ExptState>>, map: &MapHandle, expt_wait: u64) {
     let (tids, params) = {
         let st = state.lock().unwrap();
         match &st.cur_params {
-            Some(p) => (st.expt_tids.iter().copied().collect::<Vec<_>>(), p.clone()),
+            Some(p) => (st.expt_tids(), p.clone()),
             None => return,
         }
     };
@@ -179,10 +190,7 @@ fn drive_tids(state: &Arc<Mutex<ExptState>>, map: &MapHandle, expt_wait: u64) {
 /// EWMA are skipped. Returns None when no tid has a usable value — the caller
 /// then falls back to the fixed start delay.
 fn cluster_mean_delay(state: &Arc<Mutex<ExptState>>, delay_map: &MapHandle) -> Option<u64> {
-    let tids: Vec<i32> = {
-        let st = state.lock().unwrap();
-        st.expt_tids.iter().copied().collect()
-    };
+    let tids: Vec<i32> = state.lock().unwrap().expt_tids();
     let mut sum: u128 = 0;
     let mut n: u64 = 0;
     for tid in tids {
@@ -215,14 +223,9 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle, delay_map: MapH
             let params = st.cur_params_for(cluster);
             st.expt_cluster = Some(cluster);
             st.cur_params = Some(params);
-            st.expt_tids.clear();
             cluster
         };
         eprintln!("[expt] start cluster {cluster}");
-
-        // predict refills expt_tids on its next cycle; wait one so the first
-        // delay read sees the cluster's tids instead of an empty set.
-        std::thread::sleep(Duration::from_secs(1));
 
         // Grow expt_wait until a value looks bad, or until we hit the cap. The
         // cap bounds the injected delay so a task with no tolerable limit never
@@ -277,15 +280,15 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle, delay_map: MapH
         }
 
         // The cluster's search is over whether it ended on a bad value or ran
-        // out of room at the cap — either way mark it done and release the tids
-        // so they go back to being scheduled by `predict`.
+        // out of room at the cap — either way mark it done and stop claiming the
+        // cluster, so its tasks go back to being scheduled by `predict`. The
+        // membership set stays: it is the cluster's roster, not a hand-off queue.
         let mut st = state.lock().unwrap();
         if let Some(c) = st.clusters.get_mut(cluster) {
             c.done = true; // good_expt_wait holds the last OK value (0 if none)
         }
         st.expt_cluster = None;
         st.cur_params = None;
-        st.expt_tids.clear();
     }
 }
 
@@ -472,10 +475,10 @@ impl Predictor for ExptTolerancePredictor {
             .map(|(_, v)| *v)
             .unwrap_or(0.0);
 
-        // Accumulate the cluster's runtime_ratio (for cluster selection) and, if
-        // this is the cluster under experiment, hand the tid to the experiment
-        // thread instead of writing it here. The lock is held only long enough
-        // to update the shared state.
+        // Accumulate the cluster's runtime_ratio (for cluster selection), keep
+        // the cluster membership sets current, and decide whether the experiment
+        // thread owns this tid's schedule. The lock is held only long enough to
+        // update the shared state.
         let handed_off = {
             let mut st = self.state.lock().unwrap();
             if let Some(c) = st.clusters.get_mut(cluster) {
@@ -485,12 +488,26 @@ impl Predictor for ExptTolerancePredictor {
                     c.count += 1;
                 }
             }
-            if st.expt_cluster == Some(cluster) {
-                st.expt_tids.insert(tid);
-                true
-            } else {
-                false
+
+            // Membership only changes when the task's cluster does, which is
+            // rare once classification settles — so in the steady state this
+            // costs one comparison rather than a set update every cycle.
+            if stats.last_cluster != cluster as i32 {
+                if let Ok(prev) = usize::try_from(stats.last_cluster) {
+                    if let Some(c) = st.clusters.get_mut(prev) {
+                        c.tids.remove(&tid);
+                    }
+                }
+                if let Some(c) = st.clusters.get_mut(cluster) {
+                    c.tids.insert(tid);
+                }
+                stats.last_cluster = cluster as i32;
             }
+
+            // Checked every cycle, not just on a transition: a task whose
+            // cluster never changes still has to be handed off once the
+            // experiment reaches its cluster.
+            st.expt_cluster == Some(cluster)
         };
 
         if !handed_off {
