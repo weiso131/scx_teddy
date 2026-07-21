@@ -107,7 +107,7 @@ static __always_inline u64 ewma_decay(u64 old, u64 sample)
 {
     if (unlikely(old == 0))
         return sample;
-    return (old * ((1ULL << EWMA_SHIFT) - 1) + sample) >> EWMA_SHIFT;
+    return (old + sample * ((1ULL << EWMA_SHIFT) - 1)) >> EWMA_SHIFT;
 }
 
 static __always_inline void update_sched_delay(target_ctx_t *target_ctx, u64 now)
@@ -118,6 +118,7 @@ static __always_inline void update_sched_delay(target_ctx_t *target_ctx, u64 now
     if (unlikely(sample == 0))
         sample = 1;
     target_ctx->sched_delay_ewma = ewma_decay(target_ctx->sched_delay_ewma, sample);
+    target_ctx->sched_delay_stamp = now;
     target_ctx->wait_start = 0;
 }
 
@@ -150,16 +151,19 @@ struct {
 } update_map SEC(".maps");
 
 /* Per-tid scheduling-delay EWMA, exposed to userspace off the ringbuf hot path.
- * key = tid, value = sched_delay_ewma (ns). Written under the same throttle as
- * the ringbuf event (see try_data_to_user); the value is a single aligned u64,
- * so a userspace lookup copies it out without tearing — no lock needed. Lets the
- * expt_tolerance experiment loop read a task's real delay directly instead of
- * waiting for a ringbuf event. */
+ * key = tid, value = sched_delay_t (EWMA + the stamp of its last sample).
+ * Written under the same throttle as the ringbuf event (see try_data_to_user).
+ * Kept separate from the ringbuf/task_stats path so a userspace read never
+ * contends with it. A userspace lookup goes through the syscall, which copies
+ * the value out, and each publish writes the whole struct, so a reader always
+ * sees one complete publish — never a mix of two. Lets the expt_tolerance
+ * experiment loop read a task's real delay directly instead of waiting for a
+ * ringbuf event. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 256 * 1024);
     __type(key, s32);
-    __type(value, u64);
+    __type(value, sched_delay_t);
 } sched_delay_map SEC(".maps");
 
 static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
@@ -180,7 +184,10 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     /* Publish the current delay EWMA for userspace to read directly (off the
      * ringbuf path). Same throttle as the event below. */
     s32 delay_key = p->pid;
-    u64 delay = target_ctx->sched_delay_ewma;
+    sched_delay_t delay = {
+        .ewma = target_ctx->sched_delay_ewma,
+        .stamp = target_ctx->sched_delay_stamp,
+    };
     bpf_map_update_elem(&sched_delay_map, &delay_key, &delay, BPF_ANY);
 
     task_event_t *e = bpf_ringbuf_reserve(&events, sizeof(task_event_t), 0);
@@ -233,7 +240,7 @@ static target_ctx_t *get_target_storage(struct task_struct *p)
         target_ctx->last_send_time = bpf_ktime_get_ns();
 
         target_ctx->start_running = target_ctx->sleep_start = target_ctx->sleep_end = target_ctx->runtime_ns = 0;
-        target_ctx->wait_start = target_ctx->sched_delay_ewma = 0;
+        target_ctx->wait_start = target_ctx->sched_delay_ewma = target_ctx->sched_delay_stamp = 0;
     }
 
     return target_ctx;

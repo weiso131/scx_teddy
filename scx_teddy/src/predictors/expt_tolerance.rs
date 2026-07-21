@@ -44,6 +44,11 @@ const MAX_WAIT_MULTIPLE: i32 = 21; // 1000 << 20 ≈ 1.049s
 const EXPT_ROUNDS: u32 = 5;
 /// How many of those rounds must look worse for the value to count as "bad".
 const EXPT_BAD_THRESHOLD: u32 = 3;
+/// How many times a round measures fps while waiting for the cluster to publish
+/// a delay sample newer than the pre-injection mark. Each attempt costs one
+/// `measure` (~1s) with the delay still applied, so this bounds how long a
+/// round can stretch when a cluster's tasks wake infrequently.
+const DELAY_READ_ATTEMPTS: u32 = 5;
 /// Fixed slice used while experimenting when the cluster's config is adaptive:
 /// the experiment thread has no per-task stats to compute an adaptive slice.
 const EXPT_FIXED_SLICE_NS: u64 = 100 * 1000; // 100us, mirrors DEFAULT_SLICE
@@ -134,12 +139,17 @@ impl ExptState {
     }
 
     /// Pick the not-yet-done cluster with the highest runtime_ratio rank.
-    /// Returns None when every remaining cluster is done or unsampled.
+    /// Returns None when every remaining cluster is done, unsampled, or empty.
+    ///
+    /// Classification is chaotic during warm-up, so a cluster can hold stats
+    /// from tasks since classified elsewhere while holding no members at all.
+    /// Those stats still rank it, which is how an empty cluster got picked and
+    /// then measured no delay at all.
     fn pick_cluster(&self) -> Option<usize> {
         self.clusters
             .iter()
             .enumerate()
-            .filter(|(_, c)| !c.done && c.count > 0)
+            .filter(|(_, c)| !c.done && c.count > 0 && !c.tids.is_empty())
             .max_by(|(_, a), (_, b)| {
                 a.ratio_rank().partial_cmp(&b.ratio_rank())
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -185,25 +195,60 @@ fn drive_tids(state: &Arc<Mutex<ExptState>>, map: &MapHandle, expt_wait: u64) {
 /// judged over `EXPT_ROUNDS` before/delayed/after rounds. `measure` blocks
 /// (~1s) inside the layer, which paces the loop; it runs without the lock held
 /// so `predict` can keep feeding tids meanwhile.
-/// Mean sched-delay EWMA (ns) over the current cluster's tids, read live from
-/// the BPF `sched_delay_map`. Tids with no entry yet (never published) or a zero
-/// EWMA are skipped. Returns None when no tid has a usable value — the caller
-/// then falls back to the fixed start delay.
-fn cluster_mean_delay(state: &Arc<Mutex<ExptState>>, delay_map: &MapHandle) -> Option<u64> {
+/// Size of the BPF `sched_delay_t` value: the EWMA followed by its stamp.
+const DELAY_VALUE_SIZE: usize = 16;
+
+/// Read one tid's published (ewma, stamp). None when the tid has no entry yet
+/// (never published, or exited and `teddy_exit` deleted it).
+fn read_delay(delay_map: &MapHandle, tid: i32) -> Option<(u64, u64)> {
+    let key = tid.to_ne_bytes();
+    // The lookup goes through the syscall, which copies the value out, so this
+    // is a snapshot of the last publish rather than a live view of the entry.
+    match delay_map.lookup(&key, MapFlags::ANY) {
+        Ok(Some(val)) if val.len() == DELAY_VALUE_SIZE => Some((
+            u64::from_ne_bytes(val[..8].try_into().unwrap()),
+            u64::from_ne_bytes(val[8..16].try_into().unwrap()),
+        )),
+        Ok(Some(val)) => {
+            eprintln!("[expt] delay lookup(tid={tid}): unexpected value len {}", val.len());
+            None
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("[expt] delay lookup(tid={tid}) failed: {e}");
+            None
+        }
+    }
+}
+
+/// The newest sample stamp among the current cluster's tids, or 0 if none has
+/// published yet. Used as the "before" mark: a later read only counts samples
+/// stamped after this, which is what makes them post-injection.
+fn get_cluster_stamp(state: &Arc<Mutex<ExptState>>, delay_map: &MapHandle) -> u64 {
+    let tids: Vec<i32> = state.lock().unwrap().expt_tids();
+    tids.iter()
+        .filter_map(|&tid| read_delay(delay_map, tid).map(|(_, stamp)| stamp))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Mean sched-delay EWMA (ns) over the current cluster's tids, counting only
+/// samples taken after `last_stamp`
+fn cluster_mean_delay(
+    state: &Arc<Mutex<ExptState>>,
+    delay_map: &MapHandle,
+    last_stamp: u64,
+) -> Option<u64> {
     let tids: Vec<i32> = state.lock().unwrap().expt_tids();
     let mut sum: u128 = 0;
     let mut n: u64 = 0;
     for tid in tids {
-        let key = tid.to_ne_bytes();
-        // lookup copies the 8-byte value out atomically (single aligned u64).
-        if let Ok(Some(val)) = delay_map.lookup(&key, MapFlags::ANY) {
-            if val.len() == 8 {
-                let d = u64::from_ne_bytes(val[..8].try_into().unwrap());
-                if d > 0 {
-                    sum += d as u128;
-                    n += 1;
-                }
-            }
+        let Some((ewma, stamp)) = read_delay(delay_map, tid) else {
+            continue;
+        };
+        if ewma > 0 && stamp > last_stamp {
+            sum += ewma as u128;
+            n += 1;
         }
     }
     if n == 0 { None } else { Some((sum / n as u128) as u64) }
@@ -237,11 +282,25 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle, delay_map: MapH
                 // `measure` only errors while first mapping the shm; once that
                 // succeeds it always returns `Ok`
                 let before = GameFps::measure().expect("measure (before) failed after warm-up");
+                
                 drive_tids(&state, &map, expt_wait);
-                let delayed = GameFps::measure().expect("measure (delayed) failed after warm-up");
-                // Real scheduling delay under this injected wait — may exceed
-                // expt_wait if injecting it cascades into queueing.
-                let real_delay = cluster_mean_delay(&state, &delay_map);
+
+                // Mark where the cluster's samples stand before the injection,
+                // so the reads below can require newer ones.
+                let last_stamp = get_cluster_stamp(&state, &delay_map);
+
+                // Measure fps under the injected delay, and require a delay
+                // sample taken after `last_stamp` to prove the cluster actually
+                // felt it.
+                let mut delayed = GameFps::measure().expect("measure (delayed) failed after warm-up");
+                let mut real_delay = cluster_mean_delay(&state, &delay_map, last_stamp);
+                for _ in 1..DELAY_READ_ATTEMPTS {
+                    if real_delay.is_some() {
+                        break;
+                    }
+                    delayed = GameFps::measure().expect("measure (delayed) failed after warm-up");
+                    real_delay = cluster_mean_delay(&state, &delay_map, last_stamp);
+                }
                 drive_tids(&state, &map, 0);
                 let after = GameFps::measure().expect("measure (after) failed after warm-up");
 

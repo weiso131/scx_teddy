@@ -29,8 +29,13 @@ typedef signed long s64;
 
 #define DEFAULT_SLICE 100 * 1000
 
-/* Scheduling-delay EWMA weight: new = (old * (N-1) + sample) / N, with
- * N = 1 << EWMA_SHIFT. Plain integer mul/div for now; fixed-point later. */
+/* Scheduling-delay EWMA weight: new = (old + sample * (N-1)) / N, with
+ * N = 1 << EWMA_SHIFT. The sample carries the (N-1)/N weight, so the average
+ * tracks the current delay quickly. The old 1/N sample weight made the value
+ * climb far too slowly for tasks that wake infrequently: the experiment injects
+ * a delay and only gets a handful of samples before measuring, so a slow EWMA
+ * still reads mostly pre-injection delay. Plain integer mul/div for now;
+ * fixed-point later. */
 #define EWMA_SHIFT 3
 
 /* Upper bound on logical CPUs for the topology arrays below. */
@@ -50,6 +55,15 @@ typedef struct cpu_info {
     u32 freq_n;   // numerator   = this CPU's max_freq (kHz)
     u32 freq_d;   // denominator = fastest CPU's max_freq (kHz)
 } cpu_info_t;
+
+/* Value of sched_delay_map: the published delay EWMA plus the time its last
+ * sample was taken. The stamp lets userspace require a *newer* sample than one
+ * it saw earlier, instead of re-reading an average that has not moved because
+ * the task never woke. */
+typedef struct sched_delay {
+    u64 ewma;   // ns
+    u64 stamp;  // scx_bpf_now when the EWMA last took a sample (ns)
+} sched_delay_t;
 
 typedef struct task_info {
     s32 prio;
@@ -78,6 +92,9 @@ typedef struct target_ctx {
      * feed the EWMA below. */
     u64 wait_start;
     u64 sched_delay_ewma; // ns
+    /* When sched_delay_ewma last took a sample (scx_bpf_now, ns). Lets a reader
+     * tell a fresh average from one a sleeping task left behind. */
+    u64 sched_delay_stamp;
 
     u64 last_send_time;
 
