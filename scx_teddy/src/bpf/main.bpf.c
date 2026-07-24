@@ -208,6 +208,7 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     e->in_iowait_cnt = target_ctx->in_iowait_cnt;
     e->futex_wait_cnt = target_ctx->futex_wait_cnt;
     e->ntsync_wait_cnt = target_ctx->ntsync_wait_cnt;
+    e->audio_producer = target_ctx->audio_producer;
 
     // Submit to ring buffer
     bpf_ringbuf_submit(e, 0);
@@ -661,5 +662,17 @@ long BPF_KPROBE(trace_ntsync_char_ioctl, struct file *file,
         if (target_ctx)
             target_ctx->ntsync_wait_cnt++;
     }
+    return 0;
+}
+
+/* Audio-producer probe. Attached at run time to pa_stream_write in the target
+ * process's libpulse (path known only once we have target_ppid)*/
+SEC("uprobe")
+int BPF_UPROBE(trace_pa_stream_write)
+{
+    struct task_struct *p = bpf_get_current_task_btf();
+    target_ctx_t *target_ctx = get_target_storage(p);
+    if (target_ctx)
+        target_ctx->audio_producer = 1;
     return 0;
 }

@@ -10,7 +10,8 @@ pub struct TaskEvent {
     pub sleep_cnt: u32,
     pub in_iowait_cnt: u32,
     pub futex_wait_cnt: u32,
-    pub ntsync_wait_cnt: u32
+    pub ntsync_wait_cnt: u32,
+    pub audio_producer: u8
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +28,10 @@ pub struct TaskStats {
     pub in_iowait_cnt: u64,
     pub futex_wait_cnt: u64,
     pub ntsync_wait_cnt: u64,
+    /// Sticky: set true once the task has produced audio (pa_stream_write) and
+    /// never cleared, so `update` ORs it in rather than summing. Mirrors the
+    /// BPF-side sticky flag in target_ctx.
+    pub audio_producer: bool,
 
     pub event_count: u64,
     /// Union-Find ancestor pointer toward the specialization root.
@@ -84,6 +89,7 @@ impl TaskStats {
             in_iowait_cnt: 0,
             futex_wait_cnt: 0,
             ntsync_wait_cnt: 0,
+            audio_producer: false,
 
             event_count: 0,
             ancestor,
@@ -111,6 +117,8 @@ impl TaskStats {
         self.in_iowait_cnt += event.in_iowait_cnt as u64;
         self.futex_wait_cnt += event.futex_wait_cnt as u64;
         self.ntsync_wait_cnt += event.ntsync_wait_cnt as u64;
+        // Sticky: once seen, stays set, so OR rather than add.
+        self.audio_producer |= event.audio_producer != 0;
     }
 
     pub fn avg_runtime_ms(&self) -> f64 {
@@ -198,6 +206,7 @@ mod tests {
             in_iowait_cnt: 0,
             futex_wait_cnt: 0,
             ntsync_wait_cnt: 0,
+            audio_producer: 0,
         };
         stats.update(&event);
 
@@ -235,6 +244,7 @@ mod tests {
                 in_iowait_cnt: 0,
                 futex_wait_cnt: 0,
                 ntsync_wait_cnt: 0,
+                audio_producer: 0,
             });
         }
 
@@ -265,6 +275,7 @@ mod tests {
             in_iowait_cnt: 0,
             futex_wait_cnt: 0,
             ntsync_wait_cnt: 0,
+            audio_producer: 0,
         };
         // In BPF: sleep_mus = (target_ctx->sleep_end - target_ctx->sleep_start) >> 10;
         // target_ctx->sleep_sum += sleep_mus;

@@ -18,6 +18,7 @@ impl KMeansCollector {
             ("iowait_ratio", stats.sleep_base_ratio(stats.in_iowait_cnt)),
             ("futex_wait_ratio", stats.sleep_base_ratio(stats.futex_wait_cnt)),
             ("ntsync_wait_ratio", stats.sleep_base_ratio(stats.ntsync_wait_cnt)),
+            ("audio_producer", if stats.audio_producer { 1.0 } else { 0.0 }),
             ("runtime_ratio", stats.avg_runtime_ms() / (stats.avg_runtime_ms() + stats.avg_sleep_ms())),
         ]
     }

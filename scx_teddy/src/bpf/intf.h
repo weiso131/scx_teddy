@@ -107,6 +107,7 @@ typedef struct target_ctx {
     u32 in_iowait_cnt;
     u32 futex_wait_cnt;
     u32 ntsync_wait_cnt;
+    u8 audio_producer;
 } target_ctx_t;
 
 typedef struct task_event {
@@ -121,6 +122,7 @@ typedef struct task_event {
     u32 in_iowait_cnt;
     u32 futex_wait_cnt;
     u32 ntsync_wait_cnt;
+    u8 audio_producer; // sticky: 1 if this task ever produced audio (see target_ctx)
 } task_event_t;
 
 #define CONFIG_STOP_RINGBUF 0

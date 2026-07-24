@@ -22,10 +22,13 @@ use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore;
 use libbpf_rs::MapFlags;
 
+mod audio;
 mod predictor;
 mod predictors;
 mod task_stats;
 mod topology;
+
+use crate::audio::Audio;
 
 use task_stats::TaskStats;
 use crate::task_stats::TaskEvent;
@@ -161,7 +164,7 @@ type StatsMap = Rc<RefCell<HashMap<i32, RefCell<TaskStats>>>>;
 /// Process-progress logger. When `--verbose` is set it opens a log file and
 /// every `log!` call appends a line to it; otherwise it holds `None` and
 /// `log!` is a no-op. Quiet by default keeps the terminal clean.
-struct Logger {
+pub(crate) struct Logger {
     file: Option<std::fs::File>,
 }
 
@@ -188,7 +191,7 @@ impl Logger {
     }
 
     /// Append one line to the log file. No-op when not in verbose mode.
-    fn line(&mut self, msg: &str) {
+    pub(crate) fn line(&mut self, msg: &str) {
         if let Some(f) = self.file.as_mut() {
             let _ = writeln!(f, "{}", msg);
         }
@@ -826,6 +829,9 @@ fn main() -> Result<()> {
         None
     };
 
+    // Audio-producer uprobe, kept bound to the current target (see audio.rs).
+    let mut audio = Audio::new();
+
     // Main loop - keep scheduler running
     while !shutdown.load(Ordering::Acquire)
         && !scx_utils::uei_exited!(&skel, uei)
@@ -851,6 +857,11 @@ fn main() -> Result<()> {
             }
             last_control_check = Instant::now();
         }
+
+        // Keep the audio uprobe bound to the current target. Reconciled every
+        // iteration (a single int compare) rather than only on a control poll,
+        // so a target cleared by process_event also detaches the probe.
+        audio.sync(&skel.progs.trace_pa_stream_write, target_ppid.get(), &logger);
 
         if start_time.elapsed() >= duration {
             // Pause pushing events into the ring buffer while this cycle runs,
