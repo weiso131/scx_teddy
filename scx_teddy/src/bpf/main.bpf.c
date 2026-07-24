@@ -207,6 +207,7 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     e->sleep_cnt = target_ctx->sleep_cnt;
     e->in_iowait_cnt = target_ctx->in_iowait_cnt;
     e->futex_wait_cnt = target_ctx->futex_wait_cnt;
+    e->ntsync_wait_cnt = target_ctx->ntsync_wait_cnt;
 
     // Submit to ring buffer
     bpf_ringbuf_submit(e, 0);
@@ -219,6 +220,7 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     target_ctx->sleep_cnt = 0;
     target_ctx->in_iowait_cnt = 0;
     target_ctx->futex_wait_cnt = 0;
+    target_ctx->ntsync_wait_cnt = 0;
 }
 
 static target_ctx_t *get_target_storage(struct task_struct *p)
@@ -645,5 +647,19 @@ int BPF_KPROBE(trace_futex_wait)
     target_ctx_t *target_ctx = get_target_storage(p);
     if (target_ctx)
         target_ctx->futex_wait_cnt++;
+    return 0;
+}
+
+SEC("kprobe/ntsync_char_ioctl")
+long BPF_KPROBE(trace_ntsync_char_ioctl, struct file *file, 
+                unsigned int cmd, unsigned long parm)
+{
+    unsigned int nr = cmd & 0xFF;
+    if (nr == NTSYNC_WAIT_ANY_NR || nr == NTSYNC_WAIT_ALL_NR) {
+        struct task_struct *p = bpf_get_current_task_btf();
+        target_ctx_t *target_ctx = get_target_storage(p);
+        if (target_ctx)
+            target_ctx->ntsync_wait_cnt++;
+    }
     return 0;
 }

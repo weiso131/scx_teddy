@@ -106,6 +106,7 @@ typedef struct target_ctx {
     u32 sleep_cnt; // 1 ns add 1 still not overflow
     u32 in_iowait_cnt;
     u32 futex_wait_cnt;
+    u32 ntsync_wait_cnt;
 } target_ctx_t;
 
 typedef struct task_event {
@@ -119,8 +120,17 @@ typedef struct task_event {
     u32 sleep_cnt;
     u32 in_iowait_cnt;
     u32 futex_wait_cnt;
+    u32 ntsync_wait_cnt;
 } task_event_t;
 
 #define CONFIG_STOP_RINGBUF 0
 
 #define RUNTIME_MAX_TIME 100000000
+
+/* ntsync wait ioctl command numbers (the _IOC nr field), from
+ * uapi/linux/ntsync.h's NTSYNC_IOC_WAIT_ANY / NTSYNC_IOC_WAIT_ALL. The kprobe
+ * hooks ntsync_char_ioctl directly, so every cmd it sees already belongs to
+ * ntsync; masking cmd down to its 8-bit nr and matching these is enough to pick
+ * out the two wait ioctls without depending on the ioctl's encoded size. */
+#define NTSYNC_WAIT_ANY_NR 0x82
+#define NTSYNC_WAIT_ALL_NR 0x83

@@ -9,7 +9,8 @@ pub struct TaskEvent {
     pub runtime_sq_sum: u64,
     pub sleep_cnt: u32,
     pub in_iowait_cnt: u32,
-    pub futex_wait_cnt: u32
+    pub futex_wait_cnt: u32,
+    pub ntsync_wait_cnt: u32
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,7 @@ pub struct TaskStats {
 
     pub in_iowait_cnt: u64,
     pub futex_wait_cnt: u64,
+    pub ntsync_wait_cnt: u64,
 
     pub event_count: u64,
     /// Union-Find ancestor pointer toward the specialization root.
@@ -81,6 +83,7 @@ impl TaskStats {
 
             in_iowait_cnt: 0,
             futex_wait_cnt: 0,
+            ntsync_wait_cnt: 0,
 
             event_count: 0,
             ancestor,
@@ -107,6 +110,7 @@ impl TaskStats {
         
         self.in_iowait_cnt += event.in_iowait_cnt as u64;
         self.futex_wait_cnt += event.futex_wait_cnt as u64;
+        self.ntsync_wait_cnt += event.ntsync_wait_cnt as u64;
     }
 
     pub fn avg_runtime_ms(&self) -> f64 {
@@ -193,9 +197,10 @@ mod tests {
             sleep_sq_sum: 0,
             in_iowait_cnt: 0,
             futex_wait_cnt: 0,
+            ntsync_wait_cnt: 0,
         };
         stats.update(&event);
-        
+
         assert_eq!(stats.event_count, 1);
         assert_eq!(stats.avg_runtime_ms(), 10.0);
         // Stddev for single event should be 0
@@ -229,6 +234,7 @@ mod tests {
                 sleep_sq_sum: 0,
                 in_iowait_cnt: 0,
                 futex_wait_cnt: 0,
+                ntsync_wait_cnt: 0,
             });
         }
 
@@ -258,6 +264,7 @@ mod tests {
                                       // Let's re-check the update_event_data in BPF
             in_iowait_cnt: 0,
             futex_wait_cnt: 0,
+            ntsync_wait_cnt: 0,
         };
         // In BPF: sleep_mus = (target_ctx->sleep_end - target_ctx->sleep_start) >> 10;
         // target_ctx->sleep_sum += sleep_mus;
