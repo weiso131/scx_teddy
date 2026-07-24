@@ -1,6 +1,7 @@
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde::Deserialize;
-use crate::predictor::{Collector, Predictor};
+use crate::predictor::{Collector, Predictor, SchedDecision, write_sched_info};
+use crate::predictors::helper::{KMeansCore, SchedConfig};
 use crate::task_stats::TaskStats;
 
 pub struct KMeansCollector;
@@ -61,95 +62,68 @@ pub struct KMeansModel {
 
 pub struct KMeansPredictor {
     n_clusters: usize,
-    /// Indices of features in the raw feature vector.
-    feature_indices: Vec<usize>,
-    centroids: Vec<Vec<f64>>,
-    mean: Vec<f64>,
-    std: Vec<f64>,
+    /// Nearest-centroid classifier (feature selection + scaler + centroids).
+    core: KMeansCore,
+    /// Maps a cluster to its scheduling parameters. An unknown cluster falls
+    /// back to the config's `default` entry.
+    config: SchedConfig,
 }
 
 impl KMeansPredictor {
-    pub fn from_model(model: KMeansModel) -> Result<Self> {
-        if model.centroids.len() != model.n_clusters {
-            bail!(
-                "Centroid count ({}) does not match n_clusters ({})",
-                model.centroids.len(),
-                model.n_clusters
-            );
-        }
-        if model.scaler.mean.len() != model.scaler.std.len() {
-            bail!("Scaler mean/std length mismatch");
-        }
-        if model.scaler.mean.len() != model.features.len() {
-            bail!("Scaler length does not match feature count");
-        }
-
-        // Map feature names to indices
-        let available_features = KMeansCollector::feature_names();
-        let mut feature_indices = Vec::new();
-        for f_name in &model.features {
-            let idx = available_features
-                .iter()
-                .position(|&name| name == f_name)
-                .with_context(|| format!("Model requires feature '{}' which is not available", f_name))?;
-            feature_indices.push(idx);
-        }
+    pub fn from_model(model: KMeansModel, config_path: &str) -> Result<Self> {
+        let core = KMeansCore::from_model_parts(
+            model.n_clusters,
+            &model.features,
+            model.centroids,
+            model.scaler.mean,
+            model.scaler.std,
+            &KMeansCollector::feature_names(),
+        )?;
+        let config = SchedConfig::from_path(config_path)?;
 
         Ok(Self {
             n_clusters: model.n_clusters,
-            feature_indices,
-            centroids: model.centroids,
-            mean: model.scaler.mean,
-            std: model.scaler.std,
+            core,
+            config,
         })
-    }
-
-    fn standardize(&self, selected_features: &[f64]) -> Vec<f64> {
-        selected_features
-            .iter()
-            .zip(self.mean.iter().zip(self.std.iter()))
-            .map(|(&x, (&m, &s))| if s != 0.0 { (x - m) / s } else { 0.0 })
-            .collect()
     }
 }
 
 impl Predictor for KMeansPredictor {
-    fn predict(&self, stats: &mut TaskStats) -> Option<usize> {
+    fn predict(
+        &self,
+        tid: i32,
+        stats: &mut TaskStats,
+        update_map: &libbpf_rs::Map,
+    ) -> Result<Option<SchedDecision>> {
         if stats.need_update == 0 {
-            return None;
+            return Ok(None);
         }
         stats.need_update = 0;
 
-        let raw_features = KMeansCollector::feature_values(stats);
+        let named_stats = KMeansCollector::named_stats(stats);
+        let raw_features: Vec<f64> = named_stats.iter().map(|(_, v)| *v).collect();
+        let cluster = self.core.nearest_cluster(&raw_features);
 
-        // 1. Extract only the features this model was trained on
-        let selected: Vec<f64> = self.feature_indices
-            .iter()
-            .map(|&i| raw_features[i])
-            .collect();
+        let cluster_cfg = self.config.cluster_or_default(cluster);
 
-        // 2. Standardize
-        let scaled = self.standardize(&selected);
-
-        // 3. Find nearest centroid
-        let mut best_cluster = 0;
-        let mut best_dist = f64::MAX;
-
-        for (i, centroid) in self.centroids.iter().enumerate() {
-            let dist: f64 = scaled
-                .iter()
-                .zip(centroid.iter())
-                .map(|(&a, &b)| (a - b) * (a - b))
-                .sum();
-            if dist < best_dist {
-                best_dist = dist;
-                best_cluster = i;
-            }
-        }
-        Some(best_cluster)
+        let decision = SchedDecision {
+            cluster,
+            prio: cluster_cfg.prio,
+            cpu_kind: cluster_cfg.cpu_kind,
+            cpu_prefer: cluster_cfg.cpu_prefer,
+            slice_ns: cluster_cfg.compute_slice_ns(&named_stats),
+            expt_wait: 0,
+        };
+        write_sched_info(update_map, tid, &decision)?;
+        Ok(Some(decision))
     }
 
     fn n_outputs(&self) -> usize {
         self.n_clusters
+    }
+
+    fn validate(&self, cpu_kind_num: u8) -> Result<()> {
+        self.config.validate_cpu_kind(cpu_kind_num)
     }
 }

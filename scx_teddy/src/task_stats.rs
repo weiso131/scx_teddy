@@ -12,7 +12,7 @@ pub struct TaskEvent {
     pub futex_wait_cnt: u32
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TaskStats {
     // Runtime statistics
     pub runtime_sum: u64,
@@ -49,6 +49,19 @@ pub struct TaskStats {
     /// Set to 1 whenever new events arrive; cleared after the task is reclassified.
     /// Lets the classify loop skip tasks whose features haven't changed since last predict.
     pub need_update: u8,
+    /// The cluster this task was last classified into, or -1 if it has never
+    /// been classified. Lets a predictor detect that a task's cluster is
+    /// unchanged and skip the work that only matters on a transition. -1 rather
+    /// than 0 because 0 is a valid cluster id.
+    pub last_cluster: i32,
+}
+
+/// Hand-written so `last_cluster` starts at -1 ("never classified"); a derived
+/// `Default` would give 0, which is a valid cluster id.
+impl Default for TaskStats {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl TaskStats {
@@ -75,6 +88,7 @@ impl TaskStats {
             last_target: 0,
             exit: 0,
             need_update: 0,
+            last_cluster: -1,
         }
     }
 

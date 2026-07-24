@@ -86,6 +86,42 @@ static __always_inline void insert_kind_dsq(struct task_struct *p, s32 prio,
     }
 }
 
+/* Experimental DSQ id for a kind slot. slot 0 = shared, slot k = CPU kind k. */
+static __always_inline u64 exp_dsq_id(u32 kind)
+{
+    return EXP_DSQ_BASE + kind;
+}
+
+/* Insert p into the experimental vtime DSQ for its kind, with a deadline of
+ * now + target_ctx->expt_wait. The task may not run until that deadline passes
+ * (dispatch pulls it only once now >= vtime). */
+static __always_inline void insert_exp_dsq(struct task_struct *p,
+                                           target_ctx_t *target_ctx, u64 enq_flags)
+{
+    u64 vtime = scx_bpf_now() + target_ctx->expt_wait;
+    scx_bpf_dsq_insert_vtime(p, exp_dsq_id(target_ctx->kind), target_ctx->slice,
+                             vtime, enq_flags);
+}
+
+static __always_inline u64 ewma_decay(u64 old, u64 sample)
+{
+    if (unlikely(old == 0))
+        return sample;
+    return (old + sample * ((1ULL << EWMA_SHIFT) - 1)) >> EWMA_SHIFT;
+}
+
+static __always_inline void update_sched_delay(target_ctx_t *target_ctx, u64 now)
+{
+    if (unlikely(target_ctx->wait_start == 0))
+        return;
+    u64 sample = now - target_ctx->wait_start;
+    if (unlikely(sample == 0))
+        sample = 1;
+    target_ctx->sched_delay_ewma = ewma_decay(target_ctx->sched_delay_ewma, sample);
+    target_ctx->sched_delay_stamp = now;
+    target_ctx->wait_start = 0;
+}
+
 #define MIN_SEND_INTERVAL 100000000
 
 struct {
@@ -114,6 +150,22 @@ struct {
     __type(value, sched_info_t);
 } update_map SEC(".maps");
 
+/* Per-tid scheduling-delay EWMA, exposed to userspace off the ringbuf hot path.
+ * key = tid, value = sched_delay_t (EWMA + the stamp of its last sample).
+ * Written under the same throttle as the ringbuf event (see try_data_to_user).
+ * Kept separate from the ringbuf/task_stats path so a userspace read never
+ * contends with it. A userspace lookup goes through the syscall, which copies
+ * the value out, and each publish writes the whole struct, so a reader always
+ * sees one complete publish — never a mix of two. Lets the expt_tolerance
+ * experiment loop read a task's real delay directly instead of waiting for a
+ * ringbuf event. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256 * 1024);
+    __type(key, s32);
+    __type(value, sched_delay_t);
+} sched_delay_map SEC(".maps");
+
 static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
 {
     u32 key = CONFIG_STOP_RINGBUF;
@@ -128,6 +180,15 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     if (now - target_ctx->last_send_time < MIN_SEND_INTERVAL)
         return;
     target_ctx->last_send_time = now;
+
+    /* Publish the current delay EWMA for userspace to read directly (off the
+     * ringbuf path). Same throttle as the event below. */
+    s32 delay_key = p->pid;
+    sched_delay_t delay = {
+        .ewma = target_ctx->sched_delay_ewma,
+        .stamp = target_ctx->sched_delay_stamp,
+    };
+    bpf_map_update_elem(&sched_delay_map, &delay_key, &delay, BPF_ANY);
 
     task_event_t *e = bpf_ringbuf_reserve(&events, sizeof(task_event_t), 0);
     if (!e) {
@@ -175,9 +236,11 @@ static target_ctx_t *get_target_storage(struct task_struct *p)
         target_ctx->prio = DEFAULT_PRIO;
         target_ctx->config = 1;
         target_ctx->kind = 0; // default: shared DSQ (no kind restriction)
+        target_ctx->expt_wait = 0; // experimental vtime DSQ disabled by default
         target_ctx->last_send_time = bpf_ktime_get_ns();
 
         target_ctx->start_running = target_ctx->sleep_start = target_ctx->sleep_end = target_ctx->runtime_ns = 0;
+        target_ctx->wait_start = target_ctx->sched_delay_ewma = target_ctx->sched_delay_stamp = 0;
     }
 
     return target_ctx;
@@ -235,6 +298,13 @@ s32 BPF_STRUCT_OPS(teddy_select_cpu, struct task_struct *p, s32 prev_cpu,
         return prev_cpu;
     }
 
+    /* Experimental: a task with expt_wait set goes straight into the experimental
+     * vtime DSQ and skips the rest of select_cpu (and enqueue). */
+    if (target_ctx->expt_wait != 0) {
+        insert_exp_dsq(p, target_ctx, wake_flags);
+        return prev_cpu;
+    }
+
     if (target_ctx->prio >= CRITICAL_PRIO) {
         insert_kind_dsq(p, target_ctx->prio, target_ctx->kind, DEFAULT_SLICE, wake_flags);
         return prev_cpu;
@@ -284,6 +354,12 @@ void BPF_STRUCT_OPS(teddy_enqueue, struct task_struct *p, u64 enq_flags)
         return;
     }
 
+    /* Experimental: expt_wait set -> experimental vtime DSQ (same as select_cpu). */
+    if (target_ctx->expt_wait != 0) {
+        insert_exp_dsq(p, target_ctx, enq_flags);
+        return;
+    }
+
     insert_kind_dsq(p, target_ctx->prio, target_ctx->kind,
                     target_ctx->slice, enq_flags);
 }
@@ -298,6 +374,23 @@ void BPF_STRUCT_OPS(teddy_dispatch, s32 cpu, struct task_struct *prev)
         return;
     /* This CPU's kind selects which kind-only DSQ this CPU may pull from. */
     u32 kind = cpu_info[cpu].cpu_kind;
+
+    /* Experimental: highest priority of all. Pull from the experimental vtime
+     * DSQ (shared slot then this CPU's kind slot) only when the head task's
+     * deadline has passed — a task waits there until now >= its vtime. */
+    {
+        u64 now_exp = scx_bpf_now();
+        struct task_struct *head = scx_bpf_dsq_peek(exp_dsq_id(0));
+        if (head && now_exp >= head->scx.dsq_vtime) {
+            if (scx_bpf_dsq_move_to_local(exp_dsq_id(0)))
+                return;
+        }
+        head = scx_bpf_dsq_peek(exp_dsq_id(kind));
+        if (head && now_exp >= head->scx.dsq_vtime) {
+            if (scx_bpf_dsq_move_to_local(exp_dsq_id(kind)))
+                return;
+        }
+    }
 
     /* A non-fastest CPU (e.g. an E-core) may also rescue tasks stranded on the
      * fastest-kind (P-core) vtime DSQ once their deadline has passed — see
@@ -360,6 +453,16 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(teddy_init)
             return ret;
     }
 
+    /* Experimental vtime DSQ block: 1 + cpu_kind_num slots (shared + per kind),
+     * not split by priority. Bounded by the compile-time max for the verifier. */
+    for (u32 i = 0; i < 1 + MAX_CPU_KIND; i++) {
+        if (i >= dsq_per_prio())
+            break;
+        s32 ret = scx_bpf_create_dsq(EXP_DSQ_BASE + i, -1);
+        if (ret < 0)
+            return ret;
+    }
+
     return 0;
 }
 
@@ -368,8 +471,11 @@ void BPF_STRUCT_OPS(teddy_runnable, struct task_struct *p, u64 enq_flags)
     target_ctx_t *target_ctx = get_target_storage(p);
     if (!target_ctx)
         return;
+    u64 now = scx_bpf_now();
+    /* Scheduling delay starts counting the moment the task becomes runnable. */
+    target_ctx->wait_start = now;
     if (enq_flags & SCX_ENQ_WAKEUP)
-        target_ctx->sleep_end = scx_bpf_now();
+        target_ctx->sleep_end = now;
 }
 
 void BPF_STRUCT_OPS(teddy_running, struct task_struct *p)
@@ -377,7 +483,9 @@ void BPF_STRUCT_OPS(teddy_running, struct task_struct *p)
     target_ctx_t *target_ctx = get_target_storage(p);
     if (!target_ctx)
         return;
-    target_ctx->start_running = scx_bpf_now();
+    u64 now = scx_bpf_now();
+    update_sched_delay(target_ctx, now);
+    target_ctx->start_running = now;
 }
 
 static void update_event_data(target_ctx_t *target_ctx)
@@ -433,6 +541,9 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
         }
         target_ctx->sleep_start = now;
     } else {
+        /* Still runnable (slice used up): it goes back to the queue, so the
+         * scheduling delay starts counting again from here. */
+        target_ctx->wait_start = now;
         if (target_ctx->runtime_ns >= RUNTIME_MAX_TIME) {
             update_event_data(target_ctx);
             try_data_to_user(p, target_ctx);
@@ -444,6 +555,7 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
     if (unlikely(update_info)) {
         target_ctx->prio = update_info->prio;
         target_ctx->slice = update_info->slice;
+        target_ctx->expt_wait = update_info->expt_wait;
 
         /* Only apply the cpu_kind setting when the task is not bound
          * to a specific CPU. */
@@ -480,6 +592,9 @@ void BPF_STRUCT_OPS(teddy_exit_task, struct task_struct *p, struct scx_exit_task
 
     bpf_ringbuf_submit(e, 0);
 clear_tracing_data:
+    /* Drop the task's delay entry so a recycled tid never reads a stale value. */
+    pid_t delay_key = p->pid;
+    bpf_map_delete_elem(&sched_delay_map, &delay_key);
 }
 
 /* Scheduler exit - record exit info */

@@ -9,6 +9,7 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.4"
 libbpf-rs = "0.26.1"
+libc = "0.2"
 scx_utils = { git = "https://github.com/sched-ext/scx", rev = "83197d157f1cf871935cde4e71d9fcc79688c216" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use plain::Plain;
 
 use libbpf_rs::skel::OpenSkel;
@@ -29,7 +29,7 @@ mod topology;
 
 use task_stats::TaskStats;
 use crate::task_stats::TaskEvent;
-use crate::predictor::{Collector, load_collector};
+use crate::predictor::{Collector, SchedDecision, load_collector};
 
 mod bpf_skel {
     include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"));
@@ -42,82 +42,16 @@ mod bpf_intf {
 #[allow(clippy::wildcard_imports)]
 use bpf_skel::*;
 
-#[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "slice_mode")]
-enum SliceConfig {
-    /// slice = avg_runtime_ns + sigma * stddev_runtime_ns
-    #[serde(rename = "adaptive")]
-    Adaptive { slice_sigma: f64 },
-    /// slice = fixed value in ns
-    #[serde(rename = "fixed")]
-    Fixed { slice_ns: u64 },
-}
+/// A loaded predictor. It owns the config that interprets its own output, so
+/// classify mode just holds one for the default (non-target) tasks and an
+/// optional one for the target family; the two are independent and may differ
+/// in cluster count.
+type SchedSet = Box<dyn predictor::Predictor>;
 
-#[derive(Debug, Deserialize, Clone)]
-struct ClusterSchedConfig {
-    prio: i32,
-    /// DSQ slot / CPU-kind binding (1-based; 1 = fastest kind). 0 (the default
-    /// when omitted) means the shared DSQ — runnable on any CPU kind. A value
-    /// of `k` pins the cluster's tasks to the kind-only DSQ for kind `k`.
-    #[serde(default)]
-    cpu_kind: u8,
-    /// CPU speed preference for select_cpu: 0 = none, 1 = prefer fastest,
-    /// 2 = prefer slowest. Omitted (0) lets the BPF side auto-derive it from
-    /// cpu_kind when the kind is the fastest/slowest tier.
-    #[serde(default)]
-    cpu_prefer: u8,
-    #[serde(flatten)]
-    slice: SliceConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct SchedConfig {
-    clusters: HashMap<String, ClusterSchedConfig>,
-    default: ClusterSchedConfig,
-}
-
-/// A model paired with the config that interprets its clusters. Classify mode
-/// holds a `default` set (non-target tasks) and an optional `target` set; the
-/// two are independent and may differ in cluster count. Not enforced here — an
-/// unknown cluster id falls back to the config's `default` entry; the GUI
-/// validates the model↔config pairing.
-struct SchedSet {
-    model: Box<dyn predictor::Predictor>,
-    config: SchedConfig,
-}
-
-/// Load a model + config into a SchedSet. Errors are returned so the caller can
+/// Load a model + config into a predictor. Errors are returned so the caller can
 /// abort (startup) or keep the previous set (live control-file reload).
 fn load_sched_set(model_path: &str, config_path: &str) -> Result<SchedSet> {
-    let model = predictor::load_predictor(model_path)?;
-    let content = std::fs::read_to_string(config_path)
-        .with_context(|| format!("Failed to read config: {}", config_path))?;
-    let config: SchedConfig = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse config: {}", config_path))?;
-    Ok(SchedSet { model, config })
-}
-
-impl ClusterSchedConfig {
-    /// Compute the slice in ns for a task given its named runtime stats.
-    fn compute_slice_ns(&self, named_stats: &[(&str, f64)]) -> u64 {
-        match &self.slice {
-            SliceConfig::Adaptive { slice_sigma } => {
-                let lookup = |name: &str| -> f64 {
-                    named_stats.iter()
-                        .find(|(n, _)| *n == name)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.0)
-                };
-                let avg_ms = lookup("runtime_ms");
-                let cv = lookup("runtime_cv");
-                let avg_ns = avg_ms * 1_000_000.0;
-                let std_ns = avg_ms * cv * 1_000_000.0;
-                let slice = avg_ns + slice_sigma * std_ns;
-                (slice.max(1000.0)) as u64 // at least 1us
-            }
-            SliceConfig::Fixed { slice_ns } => *slice_ns,
-        }
-    }
+    predictor::load_predictor(model_path, config_path)
 }
 
 #[derive(Parser, Debug)]
@@ -195,26 +129,6 @@ fn own_tid() -> i32 {
         fn gettid() -> i32;
     }
     unsafe { gettid() }
-}
-
-/// Pack a `sched_info_t {prio: s32, kind: u8, cpu_prefer: u8, slice: u64}` and
-/// write it into `update_map` for `tid`.
-fn write_sched_info(
-    update_map: &libbpf_rs::Map,
-    tid: i32,
-    prio: i32,
-    cpu_kind: u8,
-    cpu_prefer: u8,
-    slice_ns: u64,
-) -> Result<()> {
-    let tid_key = tid.to_ne_bytes();
-    let mut val_buf = [0u8; 16];
-    val_buf[0..4].copy_from_slice(&prio.to_ne_bytes());
-    val_buf[4] = cpu_kind;
-    val_buf[5] = cpu_prefer;
-    val_buf[8..16].copy_from_slice(&slice_ns.to_ne_bytes());
-    update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
-    Ok(())
 }
 
 fn thread_cpu_time() -> Duration {
@@ -528,6 +442,7 @@ fn poll_target_set(
     last_model: &mut String,
     last_config: &mut String,
     cpu_kind_num: u8,
+    sched_delay_map: &libbpf_rs::Map,
     logger: &Rc<RefCell<Logger>>,
 ) -> Option<SchedSet> {
     let m = read_control_path(CONTROL_MODEL_PATH);
@@ -546,8 +461,9 @@ fn poll_target_set(
     }
 
     match load_sched_set(&m, &c) {
-        Ok(set) => match validate_config_kinds(&set.config, cpu_kind_num) {
+        Ok(set) => match set.validate(cpu_kind_num) {
             Ok(()) => {
+                set.attach_sched_delay_map(sched_delay_map);
                 log!(logger, "control: target set -> {} + {}", m, c);
                 Some(set)
             }
@@ -624,7 +540,6 @@ fn run_classify_cycle(
     min_events: u64,
     target_ppid: i32,
     own_tid: i32,
-    collector: &dyn Collector,
     logger: &Rc<RefCell<Logger>>,
 ) -> Result<()> {
     // GUI Overall feed: one entry per task predicted this cycle (i.e. that
@@ -671,28 +586,20 @@ fn run_classify_cycle(
             }
         }
 
-        let Some(cluster) = set.model.predict(&mut ts) else {
+        let Some(decision) = set.predict(tid, &mut ts, update_map)? else {
             continue;
         };
-        let named_stats = collector.named_stats(&ts);
         predict_count += 1;
 
-        let cluster_cfg = set.config.clusters
-            .get(&cluster.to_string())
-            .unwrap_or(&set.config.default);
-
-        let prio = cluster_cfg.prio;
-        let slice_ns = cluster_cfg.compute_slice_ns(&named_stats);
-
         snapshot.push(TaskSnapshot {
-            tid, cluster, prio, slice_ns,
-            cpu_kind: cluster_cfg.cpu_kind,
-            cpu_prefer: cluster_cfg.cpu_prefer,
+            tid,
+            cluster: decision.cluster,
+            prio: decision.prio,
+            slice_ns: decision.slice_ns,
+            cpu_kind: decision.cpu_kind,
+            cpu_prefer: decision.cpu_prefer,
             is_target,
         });
-
-        write_sched_info(update_map, tid, prio,
-            cluster_cfg.cpu_kind, cluster_cfg.cpu_prefer, slice_ns)?;
     }
 
     // Publish the snapshot for the GUI. Done before the timing log so the
@@ -708,28 +615,6 @@ fn run_classify_cycle(
     log!(logger, "  [timing] batch wall={}us cpu={}us avg={}ns/task over {} tasks",
         batch_wall_us, batch_cpu_us, avg_per_task_ns, predict_count);
 
-    Ok(())
-}
-
-/// Reject any cluster (or the default) whose `cpu_kind` exceeds the machine's
-/// kind count. Valid range is `0..=cpu_kind_num` (0 = shared / any kind, 1 =
-/// fastest kind). A binding to a non-existent kind would put tasks in a DSQ no
-/// CPU pulls from, starving them — so fail loudly at startup instead.
-fn validate_config_kinds(cfg: &SchedConfig, cpu_kind_num: u8) -> Result<()> {
-    let check = |name: &str, c: &ClusterSchedConfig| -> Result<()> {
-        if c.cpu_kind > cpu_kind_num {
-            anyhow::bail!(
-                "config {}: cpu_kind={} exceeds this machine's {} kind(s) \
-                 (valid: 0=shared, 1..={})",
-                name, c.cpu_kind, cpu_kind_num, cpu_kind_num
-            );
-        }
-        Ok(())
-    };
-    check("default", &cfg.default)?;
-    for (k, c) in &cfg.clusters {
-        check(&format!("cluster {k}"), c)?;
-    }
     Ok(())
 }
 
@@ -797,7 +682,7 @@ fn main() -> Result<()> {
             .context("Classify mode requires --config <path>")?;
         let set = load_sched_set(model_path, config_path)?;
         log!(logger, "Loaded default model {} ({} outputs) + config {}",
-            model_path, set.model.n_outputs(), config_path);
+            model_path, set.n_outputs(), config_path);
         Some(set)
     } else {
         None
@@ -814,7 +699,7 @@ fn main() -> Result<()> {
             match load_sched_set(tm, tc) {
                 Ok(set) => {
                     log!(logger, "Loaded target model {} ({} outputs) + config {}",
-                        tm, set.model.n_outputs(), tc);
+                        tm, set.n_outputs(), tc);
                     target_set = Some(set);
                     last_target_model = tm.clone();
                     last_target_config = tc.clone();
@@ -852,10 +737,10 @@ fn main() -> Result<()> {
     // have, before load — otherwise those tasks land in a DSQ that no CPU ever
     // pulls from and starve. Both the default and (if present) target config.
     if let Some(set) = &default_set {
-        validate_config_kinds(&set.config, topo.cpu_kind_num)?;
+        set.validate(topo.cpu_kind_num)?;
     }
     if let Some(set) = &target_set {
-        validate_config_kinds(&set.config, topo.cpu_kind_num)?;
+        set.validate(topo.cpu_kind_num)?;
     }
 
     let mut skel = open_skel.load().context("Failed to load BPF object")?;
@@ -889,13 +774,28 @@ fn main() -> Result<()> {
 
     let scheduler_config = &skel.maps.scheduler_config;
     let update_map = &skel.maps.update_map;
+    let sched_delay_map = &skel.maps.sched_delay_map;
+
+    // Hand the per-tid delay map to the startup sets now that it exists. A
+    // reloaded target set is given its own copy in poll_target_set.
+    if let Some(set) = &default_set {
+        set.attach_sched_delay_map(sched_delay_map);
+    }
+    if let Some(set) = &target_set {
+        set.attach_sched_delay_map(sched_delay_map);
+    }
 
     log!(logger, "scx_teddy scheduler loaded successfully!");
 
     // Give it the highest priority (0) so it is never starved by its own policy
     let own_tid = own_tid();
-    write_sched_info(update_map, own_tid, 0, 0, CPU_SLOW_PREFER, DEFAULT_SLICE_NS)
-        .context("Failed to seed scx_teddy's own scheduling info")?;
+    predictor::write_sched_info(update_map, own_tid, &SchedDecision {
+        prio: 0,
+        cpu_kind: 0,
+        cpu_prefer: CPU_SLOW_PREFER,
+        slice_ns: DEFAULT_SLICE_NS,
+        ..Default::default()
+    }).context("Failed to seed scx_teddy's own scheduling info")?;
     log!(logger, "seeded own tid {} at prio 0, kind 0, prefer slow (self-protection)", own_tid);
 
     // Shutdown flag: set by Ctrl+C, watched by the main loop.
@@ -946,7 +846,7 @@ fn main() -> Result<()> {
             if args.mode == "classify" {
                 target_set = poll_target_set(
                     target_set, &mut last_target_model, &mut last_target_config,
-                    topo.cpu_kind_num, &logger);
+                    topo.cpu_kind_num, sched_delay_map, &logger);
             }
             last_control_check = Instant::now();
         }
@@ -960,7 +860,7 @@ fn main() -> Result<()> {
             if let Some(default_set) = &default_set {
                 run_classify_cycle(&stats.borrow(), update_map,
                     default_set, target_set.as_ref(), args.min_events,
-                    target_ppid.get(), own_tid, &*collector, &logger)?;
+                    target_ppid.get(), own_tid, &logger)?;
             } else if args.csv_checkpoint {
                 // Collect mode writes the CSV every cycle only with this flag;
                 // otherwise it is flushed once on shutdown.
