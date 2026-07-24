@@ -5,11 +5,11 @@
 //! centroid" classifier — live here so they are defined once.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// How a cluster's time slice is derived. Part of `ClusterSchedConfig`.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "slice_mode")]
 pub enum SliceConfig {
     /// slice = avg_runtime_ns + sigma * stddev_runtime_ns
@@ -21,7 +21,7 @@ pub enum SliceConfig {
 }
 
 /// Per-cluster scheduling parameters, as read from the config JSON.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ClusterSchedConfig {
     pub prio: i32,
     /// DSQ slot / CPU-kind binding (1-based; 1 = fastest kind). 0 (the default
@@ -63,7 +63,7 @@ impl ClusterSchedConfig {
 
 /// The whole scheduling config: per-cluster entries keyed by cluster id (as a
 /// string), plus a `default` used for any cluster not listed.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SchedConfig {
     pub clusters: HashMap<String, ClusterSchedConfig>,
     pub default: ClusterSchedConfig,

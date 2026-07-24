@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,7 +49,11 @@ const EXPT_BAD_THRESHOLD: u32 = 3;
 /// a delay sample newer than the pre-injection mark. Each attempt costs one
 /// `measure` (~1s) with the delay still applied, so this bounds how long a
 /// round can stretch when a cluster's tasks wake infrequently.
-const DELAY_READ_ATTEMPTS: u32 = 5;
+const DELAY_READ_ATTEMPTS: u32 = 10;
+/// Least urgent priority the calibration will assign. Mirrors `DEFAULT_PRIO` in
+/// intf.h (`PRIORITY_NUM - 1`); a prio past the BPF side's range would land
+/// tasks in a DSQ that does not exist.
+const MAX_PRIO: i32 = 11;
 /// Fixed slice used while experimenting when the cluster's config is adaptive:
 /// the experiment thread has no per-task stats to compute an adaptive slice.
 const EXPT_FIXED_SLICE_NS: u64 = 100 * 1000; // 100us, mirrors DEFAULT_SLICE
@@ -72,13 +77,26 @@ struct ClusterExpt {
     /// The largest `expt_wait` that still measured OK; the tolerable delay found
     /// so far. 0 until the first good value.
     good_expt_wait: u64,
+    /// The largest *measured* delay (ns) seen across the rounds of a good
+    /// `expt_wait` — the tolerance this cluster demonstrated. Injecting a delay
+    /// does not produce exactly that delay (queueing can push the real one
+    /// higher), so this, not `good_expt_wait`, is what the priority assignment
+    /// is derived from. 0 until a good value produced a usable reading.
+    good_real_delay: u64,
     /// Whether this cluster's search has finished.
     done: bool,
 }
 
 impl ClusterExpt {
     fn new() -> Self {
-        Self { ln_sum: 0.0, count: 0, tids: HashSet::new(), good_expt_wait: 0, done: false }
+        Self {
+            ln_sum: 0.0,
+            count: 0,
+            tids: HashSet::new(),
+            good_expt_wait: 0,
+            good_real_delay: 0,
+            done: false,
+        }
     }
 
     /// Ordering key for cluster selection: the log-domain mean of runtime_ratio.
@@ -254,15 +272,22 @@ fn cluster_mean_delay(
     if n == 0 { None } else { Some((sum / n as u128) as u64) }
 }
 
-fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle, delay_map: MapHandle) {
+fn experiment_loop(
+    state: Arc<Mutex<ExptState>>,
+    map: MapHandle,
+    delay_map: MapHandle,
+    config: SchedConfig,
+    config_path: String,
+) {
     eprintln!("[expt] experiment thread started");
     loop {
-        // Pick the next cluster to experiment on. When every cluster is done
-        // there is nothing left to drive, so the thread just exits.
         let cluster = {
             let mut st = state.lock().unwrap();
             let Some(cluster) = st.pick_cluster() else {
-                eprintln!("[expt] all clusters done, experiment thread exiting");
+                eprintln!("[expt] all clusters done, calibrating");
+                // finish_calibration takes the lock itself.
+                drop(st);
+                finish_calibration(&state, &config, &config_path);
                 return;
             };
             let params = st.cur_params_for(cluster);
@@ -278,6 +303,8 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle, delay_map: MapH
         let mut expt_wait = EXPT_WAIT_START;
         for _ in 0..MAX_WAIT_MULTIPLE {
             let mut bad = 0;
+            // Largest delay actually measured across this value's rounds.
+            let mut max_real_delay = 0u64;
             for _ in 0..EXPT_ROUNDS {
                 // `measure` only errors while first mapping the shm; once that
                 // succeeds it always returns `Ok`
@@ -303,6 +330,10 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle, delay_map: MapH
                 }
                 drive_tids(&state, &map, 0);
                 let after = GameFps::measure().expect("measure (after) failed after warm-up");
+
+                if let Some(d) = real_delay {
+                    max_real_delay = max_real_delay.max(d);
+                }
 
                 eprintln!(
                     "[expt] cluster {cluster}: expt_wait={expt_wait} real_delay={} ns",
@@ -331,9 +362,14 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle, delay_map: MapH
                 break;
             }
 
-            eprintln!("[expt] cluster {cluster}: expt_wait={expt_wait} ok, doubling");
+            eprintln!(
+                "[expt] cluster {cluster}: expt_wait={expt_wait} ok \
+                 (max real_delay={max_real_delay} ns), doubling"
+            );
             if let Some(c) = state.lock().unwrap().clusters.get_mut(cluster) {
                 c.good_expt_wait = expt_wait;
+                // Keep the largest measured delay this cluster tolerated
+                c.good_real_delay = c.good_real_delay.max(max_real_delay);
             }
             expt_wait = expt_wait.saturating_mul(2);
         }
@@ -348,6 +384,100 @@ fn experiment_loop(state: Arc<Mutex<ExptState>>, map: MapHandle, delay_map: MapH
         }
         st.expt_cluster = None;
         st.cur_params = None;
+    }
+}
+
+/// How many times the smallest tolerance in a group may be multiplied before a
+/// cluster is considered too far apart to share a priority. Delays within a
+/// factor of `TOLERANCE_GROUP_K` of the group's smallest are treated as
+/// indistinguishable, since the search itself only doubles `expt_wait`.
+const TOLERANCE_GROUP_K: u64 = 2;
+
+/// Group clusters by tolerance, ordered ascending — the least tolerant group
+/// first. Walking the sorted delays, the smallest ungrouped delay anchors a
+/// group and everything up to `anchor * TOLERANCE_GROUP_K` joins it; the first
+/// delay past that bound anchors the next group. Groups are relative to each
+/// anchor rather than fixed decade boundaries, so nearby tolerances stay
+/// together regardless of where they fall on a log scale.
+fn tolerance_groups(clusters: &[ClusterExpt]) -> Vec<Vec<usize>> {
+    let mut measured: Vec<(usize, u64)> = clusters
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.good_real_delay > 0)
+        .map(|(i, c)| (i, c.good_real_delay))
+        .collect();
+    measured.sort_by_key(|&(_, delay)| delay);
+
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut anchor: Option<u64> = None;
+    for (cluster, delay) in measured {
+        match anchor {
+            // saturating_mul so a huge anchor never overflows the bound.
+            Some(a) if delay <= a.saturating_mul(TOLERANCE_GROUP_K) => {
+                groups.last_mut().expect("anchor set implies a group exists").push(cluster);
+            }
+            _ => {
+                groups.push(vec![cluster]);
+                anchor = Some(delay);
+            }
+        }
+    }
+    groups
+}
+
+/// Build a config with priorities derived from the measured tolerances
+fn calibrated_config(base: &SchedConfig, clusters: &[ClusterExpt]) -> SchedConfig {
+    let mut out = base.clone();
+    for (rank, group) in tolerance_groups(clusters).iter().enumerate() {
+        let prio = (rank as i32).min(MAX_PRIO);
+        for &cluster in group {
+            let entry = out
+                .clusters
+                .entry(cluster.to_string())
+                .or_insert_with(|| base.cluster_or_default(cluster).clone());
+            entry.prio = prio;
+        }
+    }
+    out
+}
+
+/// Write `config` next to `base_path` as `<stem>_calibrated.json`. Returns the
+/// path written. The original is never modified: the calibration is a proposal
+/// to inspect, not something to apply behind the user's back.
+fn write_calibrated_config(base_path: &str, config: &SchedConfig) -> Result<PathBuf> {
+    let base = Path::new(base_path);
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("config");
+    let out_path = base.with_file_name(format!("{stem}_calibrated.json"));
+    let json = serde_json::to_string_pretty(config)
+        .context("Failed to serialize the calibrated config")?;
+    std::fs::write(&out_path, json)
+        .with_context(|| format!("Failed to write calibrated config: {}", out_path.display()))?;
+    Ok(out_path)
+}
+
+/// Report the measured tolerances and emit the calibrated config. Called once,
+/// when every cluster's search has finished.
+fn finish_calibration(state: &Arc<Mutex<ExptState>>, config: &SchedConfig, config_path: &str) {
+    let st = state.lock().unwrap();
+
+    for (rank, group) in tolerance_groups(&st.clusters).iter().enumerate() {
+        let prio = (rank as i32).min(MAX_PRIO);
+        for &cluster in group {
+            eprintln!(
+                "[expt] cluster {cluster}: tolerance={} ns -> prio {prio}",
+                st.clusters[cluster].good_real_delay
+            );
+        }
+    }
+    for (i, c) in st.clusters.iter().enumerate() {
+        if c.good_real_delay == 0 {
+            eprintln!("[expt] cluster {i}: no measured tolerance, priority left as configured");
+        }
+    }
+
+    match write_calibrated_config(config_path, &calibrated_config(config, &st.clusters)) {
+        Ok(path) => eprintln!("[expt] calibrated config written to {}", path.display()),
+        Err(e) => eprintln!("[expt] failed to write calibrated config: {e:#}"),
     }
 }
 
@@ -431,6 +561,9 @@ pub struct ExptTolerancePredictor {
     /// Maps a cluster to its scheduling parameters. An unknown cluster falls
     /// back to the config's `default` entry.
     config: SchedConfig,
+    /// Where `config` was loaded from; the calibrated config is written beside
+    /// it when the experiment finishes.
+    config_path: String,
     /// When this predictor was created, for measuring the warm-up.
     start: Instant,
     /// Set once the experiment thread has been spawned, so it happens only once.
@@ -465,6 +598,7 @@ impl ExptTolerancePredictor {
             n_clusters: model.n_clusters,
             core,
             config,
+            config_path: config_path.to_string(),
             start: Instant::now(),
             spawned: AtomicBool::new(false),
             state: Arc::new(Mutex::new(ExptState::new(cluster_params))),
@@ -492,8 +626,14 @@ impl ExptTolerancePredictor {
         let delay_map = self.sched_delay_map.lock().unwrap().take()
             .context("sched_delay_map was never attached before the experiment spawned")?;
         let state = Arc::clone(&self.state);
+        // The thread outlives this borrow, so it gets its own copy of the config
+        // to build the calibrated one from.
+        let config = self.config.clone();
+        let config_path = self.config_path.clone();
         eprintln!("[expt] warm-up done, spawning experiment thread");
-        std::thread::spawn(move || experiment_loop(state, map, delay_map));
+        std::thread::spawn(move || {
+            experiment_loop(state, map, delay_map, config, config_path)
+        });
         Ok(())
     }
 }
