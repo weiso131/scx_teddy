@@ -53,24 +53,78 @@ unsafe impl Sync for ShmPtr {}
 
 static SHM: OnceLock<ShmPtr> = OnceLock::new();
 
-/// Map the shm read-write (we set the request flag). `O_CREAT` so either side
-/// may start first: whoever opens it first creates it.
+/// Open the shm object, creating it only if it does not exist yet.
+///
+/// We cannot just pass `O_CREAT` unconditionally: /dev/shm is a world-writable
+/// sticky directory, and with `fs.protected_regular=1` the kernel refuses an
+/// `O_CREAT` open of an existing file owned by neither the opener nor the
+/// directory owner (EACCES, from `may_create_in_sticky` in fs/namei.c). It
+/// compares uids only, so a root reader attaching to the layer's object gets no
+/// help from CAP_DAC_OVERRIDE. The check only runs under `open_flag & O_CREAT`,
+/// so a plain `O_RDWR` never trips it. This holds in both directions, so it also
+/// covers a root layer with an unprivileged reader.
+///
+/// Returns the fd and whether we created the object.
+fn open_shm_fd(cname: &CString) -> Result<(i32, bool)> {
+    loop {
+        // Try to attach to an existing object without O_CREAT.
+        let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0o666) };
+        if fd >= 0 {
+            return Ok((fd, false));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ENOENT) {
+            return Err(anyhow!("shm_open failed: {err}"));
+        }
+        // Doesn't exist yet: create it exclusively so either side may start first.
+        let fd = unsafe {
+            libc::shm_open(
+                cname.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                0o666,
+            )
+        };
+        if fd >= 0 {
+            return Ok((fd, true));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            // The layer created it between our open and create: reopen it.
+            continue;
+        }
+        return Err(anyhow!("shm_open (create) failed: {err}"));
+    }
+}
+
+/// Map the shm read-write (we set the request flag).
 fn map_shm(name: &str) -> Result<*mut FpsShm> {
     let cname = CString::new(name)?;
-    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o666) };
-    if fd < 0 {
-        return Err(anyhow!(
-            "shm_open({name}) failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    let (fd, created) = open_shm_fd(&cname)?;
     let size = std::mem::size_of::<FpsShm>();
-    // Size the object; harmless if it already exists at this size.
-    if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
-        unsafe { libc::close(fd) };
-        return Err(anyhow!("ftruncate failed: {}", std::io::Error::last_os_error()));
+    // Only size and chmod an object we created; an existing one belongs to the
+    // layer, which already set it up (and may not be ours to chmod).
+    if created {
+        if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
+            unsafe { libc::close(fd) };
+            return Err(anyhow!("ftruncate failed: {}", std::io::Error::last_os_error()));
+        }
+        unsafe { libc::fchmod(fd, 0o666) };
+    } else {
+        // We no longer resize an existing object, so check it is big enough:
+        // mapping past the end would SIGBUS on the first field read.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            unsafe { libc::close(fd) };
+            return Err(anyhow!("fstat failed: {}", std::io::Error::last_os_error()));
+        }
+        if (st.st_size as u64) < size as u64 {
+            unsafe { libc::close(fd) };
+            return Err(anyhow!(
+                "shm {name} is {} bytes, expected at least {size} (layout mismatch?)",
+                st.st_size
+            ));
+        }
     }
-    unsafe { libc::fchmod(fd, 0o666) };
     let p = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
