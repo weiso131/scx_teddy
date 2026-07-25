@@ -12,14 +12,17 @@ lives in its own file under this directory.
 
 ```rust
 pub trait Metric: Sized {
-    fn measure() -> Result<Self>;
+    fn measure(secs: u32) -> Result<Self>;
     fn compare(&self, other: &Self) -> Ordering;
 }
 ```
 
-- `measure` collects one sample and blocks until the workload produces new data.
-  The FPS detector, for instance, waits on a futex that the Vulkan hook wakes
-  once per second.
+- `measure` collects one sample over a `secs`-second window and blocks until the
+  workload has produced that much data. The FPS detector, for instance, waits on
+  a futex that the Vulkan hook wakes once the window is full. The caller picks
+  the window because only it knows how long the effect it is looking for takes to
+  show up — a cluster whose tasks wake rarely needs a longer one before an
+  injected delay is visible at all. Implementations may reject `secs == 0`.
 - `compare` returns `Greater` when `self` performed better, `Less` when worse,
   `Equal` when the two are indistinguishable. Each metric decides which
   direction is "better" — higher FPS is better, lower frame time is better — so
@@ -32,11 +35,11 @@ implementation.
 
 ```text
 loop {
-    let before  = M::measure()?;   // no injected delay
+    let before  = M::measure(secs)?;   // no injected delay
     // apply some scheduling delay
-    let delayed = M::measure()?;   // with the delay
+    let delayed = M::measure(secs)?;   // with the delay
     // remove the delay
-    let after   = M::measure()?;   // no injected delay again
+    let after   = M::measure(secs)?;   // no injected delay again
 
     delayed.compare(&before);
     delayed.compare(&after);
@@ -62,17 +65,19 @@ over a POSIX shared-memory buffer (`/dev/shm/game_fps`, overridable with
 `game_fps/fps_shm.h` and mirrored in `game_fps.rs`; **both sides must agree on
 it**.
 
-The handshake is reader-driven, which is what gives this side control over
-*when* a window is measured:
+The handshake is reader-driven, which is what gives this side control over *when*
+a window is measured and *how long* it is. `request_sec` carries both the request
+and its parameter, so `0` cannot be a window length — it already means idle:
 
-1. The reader stores `request = 1`.
-2. The layer sees it on its next present, accumulates one window, writes the
-   fields, sets `request = 0` and `FUTEX_WAKE`s the reader.
+1. The reader stores `request_sec = N` (the window length in seconds).
+2. The layer sees the nonzero value on its next present, accumulates a window
+   `N` seconds long, writes the fields, sets `request_sec = 0` and `FUTEX_WAKE`s
+   the reader.
 3. The reader, parked in `FUTEX_WAIT`, wakes and reads the fields.
 
 The layer will not write again until the reader re-arms, so the reader owns the
 buffer while reading it — no seqlock needed. With no game running the layer
-never clears `request`, so `measure()` just stays parked at ~0 CPU.
+never clears `request_sec`, so `measure()` just stays parked at ~0 CPU.
 
 `compare` orders by FPS: higher is better, so `Less` means the sample rendered
 worse.

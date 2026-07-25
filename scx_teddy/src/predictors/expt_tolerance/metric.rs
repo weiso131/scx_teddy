@@ -10,11 +10,11 @@ use std::cmp::Ordering;
 ///
 /// ```text
 /// loop {
-///     let before = M::measure()?;      // no injected delay
+///     let before = M::measure(secs)?;   // no injected delay
 ///     // apply some scheduling delay
-///     let delayed = M::measure()?;     // with the delay
+///     let delayed = M::measure(secs)?;  // with the delay
 ///     // remove the delay
-///     let after = M::measure()?;       // no injected delay again
+///     let after = M::measure(secs)?;    // no injected delay again
 ///
 ///     delayed.compare(&before);
 ///     delayed.compare(&after);
@@ -25,9 +25,12 @@ use std::cmp::Ordering;
 /// Measuring the undelayed state on both sides is what keeps the workload's own
 /// fluctuation from being read as an effect of the delay.
 pub trait Metric: Sized {
-    /// Collect one sample. Blocks until the workload produces new data (the FPS
-    /// detector, for instance, waits on a futex the hook wakes once per second).
-    fn measure() -> Result<Self>;
+    /// Collect one sample over a window `secs` seconds long, blocking until the
+    /// workload has produced that much data. The caller sets the window because
+    /// only it knows how long the effect it is looking for takes to show up: a
+    /// cluster whose tasks wake rarely needs a longer window before the injected
+    /// delay is visible at all. Implementations may reject `secs == 0`.
+    fn measure(secs: u32) -> Result<Self>;
 
     /// How this sample compares to another. `Greater` means `self` performed
     /// better, `Less` means worse, `Equal` means the two are indistinguishable.

@@ -45,11 +45,11 @@ const MAX_WAIT_MULTIPLE: i32 = 21; // 1000 << 20 ≈ 1.049s
 const EXPT_ROUNDS: u32 = 5;
 /// How many of those rounds must look worse for the value to count as "bad".
 const EXPT_BAD_THRESHOLD: u32 = 3;
-/// How many times a round measures fps while waiting for the cluster to publish
-/// a delay sample newer than the pre-injection mark. Each attempt costs one
-/// `measure` (~1s) with the delay still applied, so this bounds how long a
-/// round can stretch when a cluster's tasks wake infrequently.
-const DELAY_READ_ATTEMPTS: u32 = 10;
+/// Window length (seconds) a cluster's measurements start at.
+const MEASURE_SEC_START: u32 = 1;
+/// Longest window to grow to while chasing a fresh delay sample. Bounds how long
+/// a round can stretch when a cluster's tasks wake infrequently.
+const MEASURE_SEC_MAX: u32 = 20;
 /// Least urgent priority the calibration will assign. Mirrors `DEFAULT_PRIO` in
 /// intf.h (`PRIORITY_NUM - 1`); a prio past the BPF side's range would land
 /// tasks in a DSQ that does not exist.
@@ -272,6 +272,39 @@ fn cluster_mean_delay(
     if n == 0 { None } else { Some((sum / n as u128) as u64) }
 }
 
+/// Measure one window that the cluster demonstrably lived through: a delay
+/// sample stamped inside it proves its tasks ran while we were watching. When
+/// none appears the window was shorter than their wake period, so it grows (up
+/// to `MEASURE_SEC_MAX`) and measures again — `measure_sec` is `&mut` so that
+/// growth carries to every later call instead of being re-paid each time.
+///
+/// Returns the fps sample and the cluster's mean delay over the window, the
+/// latter `None` if the cluster stayed silent even at the longest window.
+fn measure_window(
+    state: &Arc<Mutex<ExptState>>,
+    delay_map: &MapHandle,
+    measure_sec: &mut u32,
+    phase: &str,
+    cluster: usize,
+) -> (GameFps, Option<u64>) {
+    loop {
+        // Re-marked per try so the mark and the window cover the same interval:
+        // a sample from an earlier, shorter window is not reflected in the fps
+        // we keep.
+        let last_stamp = get_cluster_stamp(state, delay_map);
+        // `measure` only errors while first mapping the shm; once that succeeds
+        // it always returns `Ok`
+        let sample = GameFps::measure(*measure_sec)
+            .unwrap_or_else(|e| panic!("measure ({phase}) failed after warm-up: {e}"));
+        let delay = cluster_mean_delay(state, delay_map, last_stamp);
+        if delay.is_some() || *measure_sec >= MEASURE_SEC_MAX {
+            return (sample, delay);
+        }
+        *measure_sec += 1;
+        eprintln!("[expt] cluster {cluster}: no fresh delay sample, window -> {measure_sec}s");
+    }
+}
+
 fn experiment_loop(
     state: Arc<Mutex<ExptState>>,
     map: MapHandle,
@@ -301,35 +334,25 @@ fn experiment_loop(
         // cap bounds the injected delay so a task with no tolerable limit never
         // gets so much delay that sched-ext tears the scheduler down.
         let mut expt_wait = EXPT_WAIT_START;
+        // Only ever grows: a bigger injected delay never needs a shorter window
+        // than the one that already worked, so restarting at the minimum each
+        // round would re-pay the same lengthening.
+        let mut measure_sec = MEASURE_SEC_START;
         for _ in 0..MAX_WAIT_MULTIPLE {
             let mut bad = 0;
             // Largest delay actually measured across this value's rounds.
             let mut max_real_delay = 0u64;
             for _ in 0..EXPT_ROUNDS {
-                // `measure` only errors while first mapping the shm; once that
-                // succeeds it always returns `Ok`
-                let before = GameFps::measure().expect("measure (before) failed after warm-up");
-                
+                let (before, _) =
+                    measure_window(&state, &delay_map, &mut measure_sec, "before", cluster);
+
                 drive_tids(&state, &map, expt_wait);
+                let (delayed, real_delay) =
+                    measure_window(&state, &delay_map, &mut measure_sec, "delayed", cluster);
 
-                // Mark where the cluster's samples stand before the injection,
-                // so the reads below can require newer ones.
-                let last_stamp = get_cluster_stamp(&state, &delay_map);
-
-                // Measure fps under the injected delay, and require a delay
-                // sample taken after `last_stamp` to prove the cluster actually
-                // felt it.
-                let mut delayed = GameFps::measure().expect("measure (delayed) failed after warm-up");
-                let mut real_delay = cluster_mean_delay(&state, &delay_map, last_stamp);
-                for _ in 1..DELAY_READ_ATTEMPTS {
-                    if real_delay.is_some() {
-                        break;
-                    }
-                    delayed = GameFps::measure().expect("measure (delayed) failed after warm-up");
-                    real_delay = cluster_mean_delay(&state, &delay_map, last_stamp);
-                }
                 drive_tids(&state, &map, 0);
-                let after = GameFps::measure().expect("measure (after) failed after warm-up");
+                let (after, _) =
+                    measure_window(&state, &delay_map, &mut measure_sec, "after", cluster);
 
                 if let Some(d) = real_delay {
                     max_real_delay = max_real_delay.max(d);
