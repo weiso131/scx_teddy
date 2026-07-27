@@ -469,6 +469,23 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(teddy_init)
     return 0;
 }
 
+s32 BPF_STRUCT_OPS(teddy_init_task, struct task_struct *p,
+                   struct scx_init_task_args *args)
+{
+    /* Runs for every task the scheduler takes on, including the ones that
+     * already existed when it attached. */
+    if (!get_target_storage(p))
+        return -ENOMEM;
+
+    /* Seed the entry as already consumed: the task has no pending settings yet,
+     * only a slot proving it is alive. */
+    s32 key = p->pid;
+    sched_info_t info = { .prio = PRIO_CONSUMED };
+    bpf_map_update_elem(&update_map, &key, &info, BPF_ANY);
+
+    return 0;
+}
+
 void BPF_STRUCT_OPS(teddy_runnable, struct task_struct *p, u64 enq_flags)
 {
     target_ctx_t *target_ctx = get_target_storage(p);
@@ -555,7 +572,7 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
 
     s32 key = p->pid;
     sched_info_t *update_info = bpf_map_lookup_elem(&update_map, &key);
-    if (unlikely(update_info)) {
+    if (unlikely(update_info && update_info->prio != PRIO_CONSUMED)) {
         target_ctx->prio = update_info->prio;
         target_ctx->slice = update_info->slice;
         target_ctx->expt_wait = update_info->expt_wait;
@@ -573,7 +590,10 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
                 target_ctx->cpu_prefer = CPU_SLOW_PREFER;
         }
 
-        bpf_map_delete_elem(&update_map, &key);
+        /* The entry stays as the task's liveness marker; only its settings are
+         * retired. `update_info` points into the map, so this is the stored
+         * value, not a copy. */
+        update_info->prio = PRIO_CONSUMED;
     }
 
 }
@@ -598,6 +618,11 @@ clear_tracing_data:
     /* Drop the task's delay entry so a recycled tid never reads a stale value. */
     pid_t delay_key = p->pid;
     bpf_map_delete_elem(&sched_delay_map, &delay_key);
+    /* Ends the task's liveness marker: a userspace write with BPF_EXIST fails
+     * from here on, so nothing recreates an entry that only `stopping` could
+     * consume and the task will never stop again. */
+    s32 update_key = p->pid;
+    bpf_map_delete_elem(&update_map, &update_key);
 }
 
 /* Scheduler exit - record exit info */
@@ -634,6 +659,7 @@ SCX_OPS_DEFINE(teddy_ops,
                .runnable       = (void *)teddy_runnable,
                .running        = (void *)teddy_running,
                .stopping       = (void *)teddy_stopping,
+               .init_task      = (void *)teddy_init_task,
                .exit_task      = (void *)teddy_exit_task,
                .init           = (void *)teddy_init,
                .exit           = (void *)teddy_exit,

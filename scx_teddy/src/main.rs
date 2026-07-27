@@ -793,14 +793,20 @@ fn main() -> Result<()> {
 
     // Give it the highest priority (0) so it is never starved by its own policy
     let own_tid = own_tid();
-    predictor::write_sched_info(update_map, own_tid, &SchedDecision {
+    // attach_struct_ops has returned, so init_task has run for every task that
+    // already existed — ours included — and the entry to write into is there.
+    let seeded = predictor::write_sched_info(update_map, own_tid, &SchedDecision {
         prio: 0,
         cpu_kind: 0,
         cpu_prefer: CPU_SLOW_PREFER,
         slice_ns: DEFAULT_SLICE_NS,
         ..Default::default()
     }).context("Failed to seed scx_teddy's own scheduling info")?;
-    log!(logger, "seeded own tid {} at prio 0, kind 0, prefer slow (self-protection)", own_tid);
+    if seeded {
+        log!(logger, "seeded own tid {} at prio 0, kind 0, prefer slow (self-protection)", own_tid);
+    } else {
+        log!(logger, "WARNING: own tid {} has no update_map entry; running without self-protection", own_tid);
+    }
 
     // Shutdown flag: set by Ctrl+C, watched by the main loop.
     let shutdown = Arc::new(AtomicBool::new(false));

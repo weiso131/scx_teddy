@@ -27,6 +27,15 @@ typedef signed long s64;
 #define CRITICAL_PRIO 4 // prio < 4 is critical
 #define DEFAULT_PRIO 11 // use lowest priority as default
 
+/* Marks an update_map entry whose settings `stopping` has already applied. Out
+ * of the valid priority range, so it can never be mistaken for a real setting.
+ *
+ * The entry itself tracks task liveness instead: init_task creates it and
+ * exit_task deletes it, so a write with BPF_EXIST fails exactly when the task is
+ * gone. That is what keeps a dead task's entry from being recreated by a writer
+ * that has not noticed the exit yet. */
+#define PRIO_CONSUMED PRIORITY_NUM
+
 #define DEFAULT_SLICE 100 * 1000
 
 /* Scheduling-delay EWMA weight: new = (old + sample * (N-1)) / N, with

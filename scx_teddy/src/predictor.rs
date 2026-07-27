@@ -25,11 +25,18 @@ pub struct SchedDecision {
 /// this from `predict` to push a decision down to BPF. Generic over the map so
 /// both a borrowed `Map` (main thread) and an owned `MapHandle` (an experiment
 /// thread) can write through it.
+///
+/// Returns whether the write landed. BPF keeps an entry for exactly as long as
+/// the task lives (created in `init_task`, deleted in `exit_task`), so writing
+/// with `EXIST` both refuses to resurrect a dead task's entry and reports the
+/// exit — in one map operation, with no window between checking and writing.
+/// `Ok(false)` is that ordinary outcome; `Err` stays reserved for a real map
+/// failure.
 pub fn write_sched_info(
     update_map: &impl MapCore,
     tid: i32,
     d: &SchedDecision,
-) -> Result<()> {
+) -> Result<bool> {
     let tid_key = tid.to_ne_bytes();
     let mut val_buf = [0u8; 24];
     val_buf[0..4].copy_from_slice(&d.prio.to_ne_bytes());
@@ -37,8 +44,11 @@ pub fn write_sched_info(
     val_buf[5] = d.cpu_prefer;
     val_buf[8..16].copy_from_slice(&d.slice_ns.to_ne_bytes());
     val_buf[16..24].copy_from_slice(&d.expt_wait.to_ne_bytes());
-    update_map.update(&tid_key, &val_buf, MapFlags::ANY)?;
-    Ok(())
+    match update_map.update(&tid_key, &val_buf, MapFlags::EXIST) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == libbpf_rs::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).context("Failed to write sched info"),
+    }
 }
 
 pub trait Predictor: Send + Sync {

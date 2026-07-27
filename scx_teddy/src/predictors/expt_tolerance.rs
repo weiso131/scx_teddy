@@ -189,11 +189,18 @@ const APPLY_WAIT_K: u32 = 2;
 /// Gap between polls of `update_map` while waiting for the writes to be applied.
 const APPLY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Whether `tid` still has an unconsumed entry in `update_map`.
+/// Mirrors `PRIO_CONSUMED` in intf.h: the prio `stopping` stamps in once it has
+/// applied an entry's settings. A manual sync point, like `MAX_PRIO`.
+const PRIO_CONSUMED: i32 = 12;
+
+/// Whether `tid` still has settings that `stopping` has not applied yet.
+/// wait just as an applied one does.
 fn update_pending(map: &MapHandle, tid: i32) -> bool {
     let key = tid.to_ne_bytes();
     match map.lookup(&key, MapFlags::ANY) {
-        Ok(Some(_)) => true,
+        Ok(Some(val)) => {
+            i32::from_ne_bytes(val[..4].try_into().unwrap()) != PRIO_CONSUMED
+        }
         Ok(None) => false,
         // Blocking the experiment on a map error would cost more than measuring
         // one task a wake-up early.
@@ -244,6 +251,8 @@ fn drive_tids(state: &Arc<Mutex<ExptState>>, map: &MapHandle, expt_wait: u64) {
             slice_ns: params.slice_ns,
             expt_wait,
         };
+        // A tid that has exited is simply skipped: the cluster's roster keeps
+        // dead tids (nothing prunes it), and they must not be waited on.
         if let Err(e) = write_sched_info(map, tid, &decision) {
             eprintln!("[expt] write_sched_info(tid={tid}) failed: {e}");
         }
@@ -785,7 +794,7 @@ impl Predictor for ExptTolerancePredictor {
         };
 
         if !handed_off {
-            write_sched_info(update_map, tid, &decision)?;
+            let _ = write_sched_info(update_map, tid, &decision)?;
         }
         Ok(Some(decision))
     }
