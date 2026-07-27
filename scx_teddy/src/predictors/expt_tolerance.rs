@@ -43,8 +43,10 @@ const EXPT_WAIT_START: u64 = 1000; // ns
 const MAX_WAIT_MULTIPLE: i32 = 21; // 1000 << 20 ≈ 1.049s
 /// How many before/delayed/after rounds to run per `expt_wait` value.
 const EXPT_ROUNDS: u32 = 5;
-/// How many of those rounds must look worse for the value to count as "bad".
-const EXPT_BAD_THRESHOLD: u32 = 3;
+/// Total percentage of the metric an `expt_wait` may cost across its rounds
+/// before it counts as "bad". Summing the drops rather than counting bad rounds
+/// lets one ruinous round and a run of mild ones both add up to a verdict.
+const DROP_SUM_THRESHOLD: f64 = 20.0;
 /// Window length (seconds) a cluster's measurements start at.
 const MEASURE_SEC_START: u32 = 1;
 /// Longest window to grow to while chasing a fresh delay sample. Bounds how long
@@ -391,7 +393,7 @@ fn experiment_loop(
         // round would re-pay the same lengthening.
         let mut measure_sec = MEASURE_SEC_START;
         for _ in 0..MAX_WAIT_MULTIPLE {
-            let mut bad = 0;
+            let mut drop_sum = 0.0;
             // Largest delay actually measured across this value's rounds.
             let mut max_real_delay = 0u64;
             for _ in 0..EXPT_ROUNDS {
@@ -417,30 +419,26 @@ fn experiment_loop(
                     max_real_delay = max_real_delay.max(d);
                 }
 
-                eprintln!(
-                    "[expt] cluster {cluster}: expt_wait={expt_wait} real_delay={} ns",
-                    real_delay.map_or("n/a".to_string(), |d| d.to_string())
-                );
+                let drop = delayed.regression(&before, &after);
+                // Negative drops are kept so the round-to-round noise cancels in
+                // the sum instead of only ever accumulating upwards.
+                drop_sum += drop;
 
-                // Bad if the delayed sample is worse than both undelayed ones.
-                if delayed.compare(&before) == std::cmp::Ordering::Less
-                    && delayed.compare(&after) == std::cmp::Ordering::Less
-                {
-                    bad += 1;
-                    // `compare` ranks purely on fps, so print all three fps to
-                    // see whether delayed really dropped or the game just jittered.
-                    eprintln!(
-                        "[expt] cluster {cluster}: expt_wait={expt_wait} bad round: \
-                         before_fps={:.1} delayed_fps={:.1} after_fps={:.1}",
-                        before.fps, delayed.fps, after.fps
-                    );
-                }
+                eprintln!(
+                    "[expt] cluster {cluster}: expt_wait={expt_wait} real_delay={} ns \
+                     drop={drop:.1}% (before_fps={:.1} delayed_fps={:.1} after_fps={:.1})",
+                    real_delay.map_or("n/a".to_string(), |d| d.to_string()),
+                    before.fps, delayed.fps, after.fps
+                );
             }
 
             // A bad value ends the search: good_expt_wait already holds the last
             // OK value. Otherwise record this value as good and double it.
-            if bad >= EXPT_BAD_THRESHOLD {
-                eprintln!("[expt] cluster {cluster}: expt_wait={expt_wait} bad ({bad}/{EXPT_ROUNDS}) -> done");
+            if drop_sum >= DROP_SUM_THRESHOLD {
+                eprintln!(
+                    "[expt] cluster {cluster}: expt_wait={expt_wait} bad \
+                     (drop_sum={drop_sum:.1}%) -> done"
+                );
                 break;
             }
 

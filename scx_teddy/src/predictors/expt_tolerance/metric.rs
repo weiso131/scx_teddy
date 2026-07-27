@@ -1,9 +1,8 @@
 use anyhow::Result;
-use std::cmp::Ordering;
 
 /// One measurement of how the workload is actually performing (game FPS, frame
 /// time, input latency, ...). What a metric holds is up to the implementation;
-/// the experiment loop only ever measures and compares. Used by the predictor
+/// the experiment loop only ever measures and scores. Used by the predictor
 /// that searches for a task's tolerable scheduling delay — nothing else needs it.
 ///
 /// The loop that finds a task's tolerable scheduling delay is, in outline:
@@ -16,9 +15,7 @@ use std::cmp::Ordering;
 ///     // remove the delay
 ///     let after = M::measure(secs)?;    // no injected delay again
 ///
-///     delayed.compare(&before);
-///     delayed.compare(&after);
-///     // worse than both -> that delay is probably not acceptable
+///     delayed.regression(&before, &after); // how much the delay cost
 /// }
 /// ```
 ///
@@ -32,9 +29,8 @@ pub trait Metric: Sized {
     /// delay is visible at all. Implementations may reject `secs == 0`.
     fn measure(secs: u32) -> Result<Self>;
 
-    /// How this sample compares to another. `Greater` means `self` performed
-    /// better, `Less` means worse, `Equal` means the two are indistinguishable.
-    /// Each metric defines which direction is "better" (higher FPS is better,
-    /// lower frame time is better), so callers can always read `Less` as worse.
-    fn compare(&self, other: &Self) -> Ordering;
+    /// How much worse this delayed sample is than the undelayed ones around it,
+    /// as a percentage. 0 means indistinguishable, 50 means it performed half as
+    /// well, negative means it came out ahead.
+    fn regression(&self, before: &Self, after: &Self) -> f64;
 }

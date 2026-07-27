@@ -19,7 +19,6 @@
 //!   LATENCY_SHM_NAME   shm name (default "/game_fps")
 
 use anyhow::{Result, anyhow};
-use std::cmp::Ordering;
 use std::ffi::CString;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
@@ -37,8 +36,6 @@ struct FpsShm {
     max_frametime_ms: f64,
     frame_count: u64,
 }
-
-const FPS_EPS: f64 = 0.02;
 
 /// One measured window of game rendering.
 #[derive(Debug, Clone)]
@@ -200,24 +197,18 @@ impl Metric for GameFps {
         })
     }
 
-    /// Higher FPS is better, so `Less` means this sample rendered worse.
-    /// Differences within `FPS_EPS` (relative) are treated as `Equal` so the
-    /// game's own jitter is not mistaken for a delay-induced regression. NaN on
-    /// either side is reported as indistinguishable.
-    fn compare(&self, other: &Self) -> Ordering {
-        let (a, b) = (self.fps, other.fps);
-        if a.is_nan() || b.is_nan() {
-            return Ordering::Equal;
-        }
-        // Relative tolerance against the larger magnitude, so the threshold
-        // scales with the fps level rather than being a fixed absolute gap.
-        let tol = FPS_EPS * a.abs().max(b.abs());
-        if (a - b).abs() <= tol {
-            Ordering::Equal
-        } else if a < b {
-            Ordering::Less
-        } else {
-            Ordering::Greater
-        }
+    /// Percentage of the framerate the injected delay cost, measured against
+    /// whichever undelayed window flattered it more: a drop only counts as far
+    /// as it holds against both sides, so a game that was already sliding into a
+    /// heavier scene does not read as a delay-induced one.
+    fn regression(&self, before: &Self, after: &Self) -> f64 {
+        let drop = |baseline: &Self| {
+            // A baseline of zero fps has nothing to be a fraction of.
+            if self.fps.is_nan() || baseline.fps.is_nan() || baseline.fps <= 0.0 {
+                return 0.0;
+            }
+            (baseline.fps - self.fps) / baseline.fps * 100.0
+        };
+        drop(before).min(drop(after))
     }
 }
