@@ -118,7 +118,7 @@ static __always_inline void update_sched_delay(target_ctx_t *target_ctx, u64 now
     if (unlikely(sample == 0))
         sample = 1;
     target_ctx->sched_delay_ewma = ewma_decay(target_ctx->sched_delay_ewma, sample);
-    target_ctx->sched_delay_stamp = now;
+    target_ctx->sched_delay_epoch = target_ctx->epoch;
     target_ctx->wait_start = 0;
 }
 
@@ -151,7 +151,7 @@ struct {
 } update_map SEC(".maps");
 
 /* Per-tid scheduling-delay EWMA, exposed to userspace off the ringbuf hot path.
- * key = tid, value = sched_delay_t (EWMA + the stamp of its last sample).
+ * key = tid, value = sched_delay_t (EWMA + the epoch its last sample ran under).
  * Written under the same throttle as the ringbuf event (see try_data_to_user).
  * Kept separate from the ringbuf/task_stats path so a userspace read never
  * contends with it. A userspace lookup goes through the syscall, which copies
@@ -186,7 +186,7 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     s32 delay_key = p->pid;
     sched_delay_t delay = {
         .ewma = target_ctx->sched_delay_ewma,
-        .stamp = target_ctx->sched_delay_stamp,
+        .epoch = target_ctx->sched_delay_epoch,
     };
     bpf_map_update_elem(&sched_delay_map, &delay_key, &delay, BPF_ANY);
 
@@ -240,10 +240,11 @@ static target_ctx_t *get_target_storage(struct task_struct *p)
         target_ctx->config = 1;
         target_ctx->kind = 0; // default: shared DSQ (no kind restriction)
         target_ctx->expt_wait = 0; // experimental vtime DSQ disabled by default
+        target_ctx->epoch = 0;
         target_ctx->last_send_time = bpf_ktime_get_ns();
 
         target_ctx->start_running = target_ctx->sleep_start = target_ctx->sleep_end = target_ctx->runtime_ns = 0;
-        target_ctx->wait_start = target_ctx->sched_delay_ewma = target_ctx->sched_delay_stamp = 0;
+        target_ctx->wait_start = target_ctx->sched_delay_ewma = target_ctx->sched_delay_epoch = 0;
     }
 
     return target_ctx;
@@ -507,6 +508,7 @@ void BPF_STRUCT_OPS(teddy_runnable, struct task_struct *p, u64 enq_flags)
         target_ctx->prio = update_info->prio;
         target_ctx->slice = update_info->slice;
         target_ctx->expt_wait = update_info->expt_wait;
+        target_ctx->epoch = update_info->epoch;
 
         /* Only apply the cpu_kind setting when the task is not bound
          * to a specific CPU. */

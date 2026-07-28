@@ -65,13 +65,14 @@ typedef struct cpu_info {
     u32 freq_d;   // denominator = fastest CPU's max_freq (kHz)
 } cpu_info_t;
 
-/* Value of sched_delay_map: the published delay EWMA plus the time its last
- * sample was taken. The stamp lets userspace require a *newer* sample than one
- * it saw earlier, instead of re-reading an average that has not moved because
- * the task never woke. */
+/* Value of sched_delay_map: the published delay EWMA plus the epoch of the
+ * settings it was measured under. Requiring a matching epoch is strictly
+ * stronger than requiring a recent sample: the delay is measured in `running`
+ * but only published in `stopping`, so a sample can arrive well after the write
+ * that superseded it and still describe the old settings. */
 typedef struct sched_delay {
     u64 ewma;   // ns
-    u64 stamp;  // scx_bpf_now when the EWMA last took a sample (ns)
+    u64 epoch;  // the epoch in force when the EWMA last took a sample
 } sched_delay_t;
 
 typedef struct task_info {
@@ -80,6 +81,11 @@ typedef struct task_info {
     u8 cpu_prefer;
     u64 slice; // ns
     u64 expt_wait;  // experimental vtime DSQ deadline (ns); 0 = disabled
+    /* Identifies which write these settings came from, so a published delay can
+     * be tied back to the settings it ran under. Only the experiment reads it,
+     * and it drives a whole cluster with one set of params, so a single counter
+     * shared by every task is enough. */
+    u64 epoch;
 } sched_info_t;
 
 typedef struct target_ctx {
@@ -90,6 +96,7 @@ typedef struct target_ctx {
     u8 kind;  // DSQ slot: 0 = shared (any kind), 1..cpu_kind_num = kind-only
     u8 cpu_prefer;
     u64 expt_wait;  // experimental vtime DSQ deadline (ns); 0 = disabled
+    u64 epoch;      // epoch of the settings above (see sched_info_t)
 
     u64 start_running;
     u64 sleep_start;
@@ -101,9 +108,10 @@ typedef struct target_ctx {
      * feed the EWMA below. */
     u64 wait_start;
     u64 sched_delay_ewma; // ns
-    /* When sched_delay_ewma last took a sample (scx_bpf_now, ns). Lets a reader
-     * tell a fresh average from one a sleeping task left behind. */
-    u64 sched_delay_stamp;
+    /* The epoch in force when sched_delay_ewma last took a sample. Captured at
+     * sample time rather than at publish time: publishing happens in `stopping`,
+     * by which point the task may already have picked up newer settings. */
+    u64 sched_delay_epoch;
 
     u64 last_send_time;
 

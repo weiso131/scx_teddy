@@ -18,13 +18,17 @@ pub struct SchedDecision {
     pub cpu_prefer: u8,
     pub slice_ns: u64,
     pub expt_wait: u64,
+    /// Tags this write so a delay sample published later can be matched back to
+    /// it. Only the experiment reads it back; predictors that do not care leave
+    /// it at 0.
+    pub epoch: u64,
 }
 
 /// Pack a `sched_info_t {prio: s32, kind: u8, cpu_prefer: u8, slice: u64,
-/// expt_wait: u64}` and write it into `update_map` for `tid`. Predictors call
-/// this from `predict` to push a decision down to BPF. Generic over the map so
-/// both a borrowed `Map` (main thread) and an owned `MapHandle` (an experiment
-/// thread) can write through it.
+/// expt_wait: u64, epoch: u64}` and write it into `update_map` for `tid`.
+/// Predictors call this from `predict` to push a decision down to BPF. Generic
+/// over the map so both a borrowed `Map` (main thread) and an owned `MapHandle`
+/// (an experiment thread) can write through it.
 ///
 /// Returns whether the write landed. BPF keeps an entry for exactly as long as
 /// the task lives (created in `init_task`, deleted in `exit_task`), so writing
@@ -38,12 +42,13 @@ pub fn write_sched_info(
     d: &SchedDecision,
 ) -> Result<bool> {
     let tid_key = tid.to_ne_bytes();
-    let mut val_buf = [0u8; 24];
+    let mut val_buf = [0u8; 32];
     val_buf[0..4].copy_from_slice(&d.prio.to_ne_bytes());
     val_buf[4] = d.cpu_kind;
     val_buf[5] = d.cpu_prefer;
     val_buf[8..16].copy_from_slice(&d.slice_ns.to_ne_bytes());
     val_buf[16..24].copy_from_slice(&d.expt_wait.to_ne_bytes());
+    val_buf[24..32].copy_from_slice(&d.epoch.to_ne_bytes());
     match update_map.update(&tid_key, &val_buf, MapFlags::EXIST) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == libbpf_rs::ErrorKind::NotFound => Ok(false),

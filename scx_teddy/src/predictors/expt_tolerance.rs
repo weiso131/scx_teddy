@@ -184,9 +184,10 @@ impl ExptState {
 }
 
 /// Write `expt_wait` (with the cluster-under-test's params) to every tid in the
-/// cluster under test. Snapshots the tid set under the lock, then writes without
-/// it held so `predict` is not blocked during the map updates.
-fn drive_tids(state: &Arc<Mutex<ExptState>>, map: &MapHandle, expt_wait: u64) {
+/// cluster under test, tagging the write with `epoch`. Snapshots the tid set
+/// under the lock, then writes without it held so `predict` is not blocked
+/// during the map updates.
+fn drive_tids(state: &Arc<Mutex<ExptState>>, map: &MapHandle, expt_wait: u64, epoch: u64) {
     let (tids, params) = {
         let st = state.lock().unwrap();
         match &st.cur_params {
@@ -202,6 +203,7 @@ fn drive_tids(state: &Arc<Mutex<ExptState>>, map: &MapHandle, expt_wait: u64) {
             cpu_prefer: params.cpu_prefer,
             slice_ns: params.slice_ns,
             expt_wait,
+            epoch,
         };
         // A tid that has exited is simply skipped: the cluster's roster keeps
         // dead tids (nothing prunes it), and they must not be waited on.
@@ -217,10 +219,10 @@ fn drive_tids(state: &Arc<Mutex<ExptState>>, map: &MapHandle, expt_wait: u64) {
 /// judged over `EXPT_ROUNDS` before/delayed/after rounds. `measure` blocks
 /// (~1s) inside the layer, which paces the loop; it runs without the lock held
 /// so `predict` can keep feeding tids meanwhile.
-/// Size of the BPF `sched_delay_t` value: the EWMA followed by its stamp.
+/// Size of the BPF `sched_delay_t` value: the EWMA followed by its epoch.
 const DELAY_VALUE_SIZE: usize = 16;
 
-/// Read one tid's published (ewma, stamp). None when the tid has no entry yet
+/// Read one tid's published (ewma, epoch). None when the tid has no entry yet
 /// (never published, or exited and `teddy_exit` deleted it).
 fn read_delay(delay_map: &MapHandle, tid: i32) -> Option<(u64, u64)> {
     let key = tid.to_ne_bytes();
@@ -243,32 +245,22 @@ fn read_delay(delay_map: &MapHandle, tid: i32) -> Option<(u64, u64)> {
     }
 }
 
-/// The newest sample stamp among the current cluster's tids, or 0 if none has
-/// published yet. Used as the "before" mark: a later read only counts samples
-/// stamped after this, which is what makes them post-injection.
-fn get_cluster_stamp(state: &Arc<Mutex<ExptState>>, delay_map: &MapHandle) -> u64 {
-    let tids: Vec<i32> = state.lock().unwrap().expt_tids();
-    tids.iter()
-        .filter_map(|&tid| read_delay(delay_map, tid).map(|(_, stamp)| stamp))
-        .max()
-        .unwrap_or(0)
-}
-
 /// Mean sched-delay EWMA (ns) over the current cluster's tids, counting only
-/// samples taken after `last_stamp`
+/// samples taken under `epoch` — that is, measured while the params this round
+/// wrote were the ones in force.
 fn cluster_mean_delay(
     state: &Arc<Mutex<ExptState>>,
     delay_map: &MapHandle,
-    last_stamp: u64,
+    epoch: u64,
 ) -> Option<u64> {
     let tids: Vec<i32> = state.lock().unwrap().expt_tids();
     let mut sum: u128 = 0;
     let mut n: u64 = 0;
     for tid in tids {
-        let Some((ewma, stamp)) = read_delay(delay_map, tid) else {
+        let Some((ewma, sample_epoch)) = read_delay(delay_map, tid) else {
             continue;
         };
-        if ewma > 0 && stamp > last_stamp {
+        if ewma > 0 && sample_epoch == epoch {
             sum += ewma as u128;
             n += 1;
         }
@@ -276,10 +268,11 @@ fn cluster_mean_delay(
     if n == 0 { None } else { Some((sum / n as u128) as u64) }
 }
 
-/// Measure one window that the cluster demonstrably lived through: a delay
-/// sample stamped inside it proves its tasks ran while we were watching. When
-/// none appears the window was shorter than their wake period, so it grows (up
-/// to `MEASURE_SEC_MAX`) and measures again — `measure_sec` is `&mut` so that
+/// Measure one window that the cluster demonstrably lived through under
+/// `epoch`'s params: a delay sample carrying that epoch proves its tasks both
+/// picked the params up and ran while we were watching. When none appears the
+/// window was shorter than their wake period, so it grows (up to
+/// `MEASURE_SEC_MAX`) and measures again — `measure_sec` is `&mut` so that
 /// growth carries to every later call instead of being re-paid each time.
 ///
 /// Returns the fps sample and the cluster's mean delay over the window, the
@@ -288,24 +281,21 @@ fn measure_window(
     state: &Arc<Mutex<ExptState>>,
     delay_map: &MapHandle,
     measure_sec: &mut u32,
+    epoch: u64,
     phase: &str,
     cluster: usize,
 ) -> (GameFps, Option<u64>) {
     loop {
-        // Re-marked per try so the mark and the window cover the same interval:
-        // a sample from an earlier, shorter window is not reflected in the fps
-        // we keep.
-        let last_stamp = get_cluster_stamp(state, delay_map);
         // `measure` only errors while first mapping the shm; once that succeeds
         // it always returns `Ok`
         let sample = GameFps::measure(*measure_sec)
             .unwrap_or_else(|e| panic!("measure ({phase}) failed after warm-up: {e}"));
-        let delay = cluster_mean_delay(state, delay_map, last_stamp);
+        let delay = cluster_mean_delay(state, delay_map, epoch);
         if delay.is_some() || *measure_sec >= MEASURE_SEC_MAX {
             return (sample, delay);
         }
         *measure_sec += 1;
-        eprintln!("[expt] cluster {cluster}: no fresh delay sample, window -> {measure_sec}s");
+        eprintln!("[expt] cluster {cluster}: no sample for epoch {epoch}, window -> {measure_sec}s");
     }
 }
 
@@ -334,6 +324,12 @@ fn experiment_loop(
         };
         eprintln!("[expt] start cluster {cluster}");
 
+        // Restarts per cluster: a cluster's tasks have never been driven when it
+        // is picked, so they carry epoch 0, and the first `before` has to ask for
+        // the epoch they actually hold. Only the cluster under test is read, so
+        // the numbers never have to be unique across clusters.
+        let mut epoch: u64 = 0;
+
         // Grow expt_wait until a value looks bad, or until we hit the cap. The
         // cap bounds the injected delay so a task with no tolerable limit never
         // gets so much delay that sched-ext tears the scheduler down.
@@ -347,16 +343,21 @@ fn experiment_loop(
             // Largest delay actually measured across this value's rounds.
             let mut max_real_delay = 0u64;
             for _ in 0..EXPT_ROUNDS {
+                // Matches the epoch the previous round's restore wrote, or 0 on
+                // the first round — which the cluster's tasks still carry, and
+                // which means the same thing here: no delay injected.
                 let (before, _) =
-                    measure_window(&state, &delay_map, &mut measure_sec, "before", cluster);
+                    measure_window(&state, &delay_map, &mut measure_sec, epoch, "before", cluster);
 
-                drive_tids(&state, &map, expt_wait);
+                epoch += 1;
+                drive_tids(&state, &map, expt_wait, epoch);
                 let (delayed, real_delay) =
-                    measure_window(&state, &delay_map, &mut measure_sec, "delayed", cluster);
+                    measure_window(&state, &delay_map, &mut measure_sec, epoch, "delayed", cluster);
 
-                drive_tids(&state, &map, 0);
+                epoch += 1;
+                drive_tids(&state, &map, 0, epoch);
                 let (after, _) =
-                    measure_window(&state, &delay_map, &mut measure_sec, "after", cluster);
+                    measure_window(&state, &delay_map, &mut measure_sec, epoch, "after", cluster);
 
                 if let Some(d) = real_delay {
                     max_real_delay = max_real_delay.max(d);
@@ -368,7 +369,7 @@ fn experiment_loop(
                 drop_sum += drop;
 
                 eprintln!(
-                    "[expt] cluster {cluster}: expt_wait={expt_wait} real_delay={} ns \
+                    "[expt] cluster {cluster}: expt_wait={expt_wait} epoch={epoch} real_delay={} ns \
                      drop={drop:.1}% (before_fps={:.1} delayed_fps={:.1} after_fps={:.1})",
                     real_delay.map_or("n/a".to_string(), |d| d.to_string()),
                     before.fps, delayed.fps, after.fps
@@ -691,6 +692,7 @@ impl Predictor for ExptTolerancePredictor {
             cpu_prefer: cluster_cfg.cpu_prefer,
             slice_ns: cluster_cfg.compute_slice_ns(&named_stats),
             expt_wait: 0,
+            epoch: 0,
         };
 
         let runtime_ratio = named_stats

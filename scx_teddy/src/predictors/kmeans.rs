@@ -116,6 +116,7 @@ impl Predictor for KMeansPredictor {
             cpu_prefer: cluster_cfg.cpu_prefer,
             slice_ns: cluster_cfg.compute_slice_ns(&named_stats),
             expt_wait: 0,
+            epoch: 0,
         };
         let _ = write_sched_info(update_map, tid, &decision)?;
         Ok(Some(decision))
