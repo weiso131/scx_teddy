@@ -110,18 +110,6 @@ static __always_inline u64 ewma_decay(u64 old, u64 sample)
     return (old + sample * ((1ULL << EWMA_SHIFT) - 1)) >> EWMA_SHIFT;
 }
 
-static __always_inline void update_sched_delay(target_ctx_t *target_ctx, u64 now)
-{
-    if (unlikely(target_ctx->wait_start == 0))
-        return;
-    u64 sample = now - target_ctx->wait_start;
-    if (unlikely(sample == 0))
-        sample = 1;
-    target_ctx->sched_delay_ewma = ewma_decay(target_ctx->sched_delay_ewma, sample);
-    target_ctx->sched_delay_epoch = target_ctx->epoch;
-    target_ctx->wait_start = 0;
-}
-
 #define MIN_SEND_INTERVAL 100000000
 
 struct {
@@ -166,6 +154,38 @@ struct {
     __type(value, sched_delay_t);
 } sched_delay_map SEC(".maps");
 
+static __always_inline void publish_sched_delay(struct task_struct *p,
+                                                target_ctx_t *target_ctx)
+{
+    s32 delay_key = p->pid;
+    sched_delay_t delay = {
+        .ewma = target_ctx->sched_delay_ewma,
+        .epoch = target_ctx->sched_delay_epoch,
+    };
+    bpf_map_update_elem(&sched_delay_map, &delay_key, &delay, BPF_ANY);
+}
+
+static __always_inline void update_sched_delay(struct task_struct *p,
+                                               target_ctx_t *target_ctx, u64 now)
+{
+    if (unlikely(target_ctx->wait_start == 0))
+        return;
+    u64 sample = now - target_ctx->wait_start;
+    if (unlikely(sample == 0))
+        sample = 1;
+    target_ctx->sched_delay_ewma = ewma_decay(target_ctx->sched_delay_ewma, sample);
+    target_ctx->wait_start = 0;
+
+    /* The first sample of a new epoch goes out immediately, bypassing
+     * try_data_to_user's throttle: a reader waiting on this epoch has nothing
+     * else to wait for, and would otherwise sit through MIN_SEND_INTERVAL plus
+     * the rest of this run before the value it needs is published. */
+    bool epoch_changed = target_ctx->sched_delay_epoch != target_ctx->epoch;
+    target_ctx->sched_delay_epoch = target_ctx->epoch;
+    if (unlikely(epoch_changed))
+        publish_sched_delay(p, target_ctx);
+}
+
 static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
 {
     u32 key = CONFIG_STOP_RINGBUF;
@@ -183,12 +203,7 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
 
     /* Publish the current delay EWMA for userspace to read directly (off the
      * ringbuf path). Same throttle as the event below. */
-    s32 delay_key = p->pid;
-    sched_delay_t delay = {
-        .ewma = target_ctx->sched_delay_ewma,
-        .epoch = target_ctx->sched_delay_epoch,
-    };
-    bpf_map_update_elem(&sched_delay_map, &delay_key, &delay, BPF_ANY);
+    publish_sched_delay(p, target_ctx);
 
     task_event_t *e = bpf_ringbuf_reserve(&events, sizeof(task_event_t), 0);
     if (!e) {
@@ -536,7 +551,7 @@ void BPF_STRUCT_OPS(teddy_running, struct task_struct *p)
     if (!target_ctx)
         return;
     u64 now = scx_bpf_now();
-    update_sched_delay(target_ctx, now);
+    update_sched_delay(p, target_ctx, now);
     target_ctx->start_running = now;
 }
 
