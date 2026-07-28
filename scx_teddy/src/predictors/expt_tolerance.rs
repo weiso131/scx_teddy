@@ -183,56 +183,6 @@ impl ExptState {
     }
 }
 
-/// How many times `measure_sec` a wait for the injected params to be applied may
-/// take before the stragglers are given up on. Waiting for *every* task to wake
-/// takes longer than the window that merely needs *some* task to publish, so the
-/// budget is a multiple of it rather than the window itself.
-const APPLY_WAIT_K: u32 = 2;
-/// Gap between polls of `update_map` while waiting for the writes to be applied.
-const APPLY_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Mirrors `PRIO_CONSUMED` in intf.h: the prio `stopping` stamps in once it has
-/// applied an entry's settings. A manual sync point, like `MAX_PRIO`.
-const PRIO_CONSUMED: i32 = 12;
-
-/// Whether `tid` still has settings that `stopping` has not applied yet.
-/// wait just as an applied one does.
-fn update_pending(map: &MapHandle, tid: i32) -> bool {
-    let key = tid.to_ne_bytes();
-    match map.lookup(&key, MapFlags::ANY) {
-        Ok(Some(val)) => {
-            i32::from_ne_bytes(val[..4].try_into().unwrap()) != PRIO_CONSUMED
-        }
-        Ok(None) => false,
-        // Blocking the experiment on a map error would cost more than measuring
-        // one task a wake-up early.
-        Err(e) => {
-            eprintln!("[expt] update lookup(tid={tid}) failed: {e}");
-            false
-        }
-    }
-}
-
-/// Wait until every tid has picked up the params just written for it.
-fn wait_applied(map: &MapHandle, tids: &[i32], measure_sec: u32, cluster: usize) {
-    let deadline = Instant::now() + Duration::from_secs((measure_sec * APPLY_WAIT_K) as u64);
-    let mut pending: Vec<i32> = tids.to_vec();
-    loop {
-        pending.retain(|&tid| update_pending(map, tid));
-        if pending.is_empty() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            eprintln!(
-                "[expt] cluster {cluster}: {} task(s) never applied the new params: {pending:?}",
-                pending.len()
-            );
-            return;
-        }
-        std::thread::sleep(APPLY_POLL_INTERVAL);
-    }
-}
-
 /// Write `expt_wait` (with the cluster-under-test's params) to every tid in the
 /// cluster under test. Snapshots the tid set under the lock, then writes without
 /// it held so `predict` is not blocked during the map updates.
@@ -401,17 +351,10 @@ fn experiment_loop(
                     measure_window(&state, &delay_map, &mut measure_sec, "before", cluster);
 
                 drive_tids(&state, &map, expt_wait);
-                // Bound separately: holding the guard across wait_applied would
-                // block `predict` for the whole wait.
-                let driven = state.lock().unwrap().expt_tids();
-                wait_applied(&map, &driven, measure_sec, cluster);
                 let (delayed, real_delay) =
                     measure_window(&state, &delay_map, &mut measure_sec, "delayed", cluster);
 
                 drive_tids(&state, &map, 0);
-                // Symmetric to the injection: until a task stops, it is still
-                // running with the delay the round is supposed to have removed.
-                wait_applied(&map, &driven, measure_sec, cluster);
                 let (after, _) =
                     measure_window(&state, &delay_map, &mut measure_sec, "after", cluster);
 

@@ -496,6 +496,36 @@ void BPF_STRUCT_OPS(teddy_runnable, struct task_struct *p, u64 enq_flags)
     target_ctx->wait_start = now;
     if (enq_flags & SCX_ENQ_WAKEUP)
         target_ctx->sleep_end = now;
+
+    /* Applied on the way in rather than on the way out: everything below is read
+     * by `select_cpu`/`enqueue`, which run right after this, so a write takes
+     * effect on the very next dispatch. A task that runs rarely would otherwise
+     * have to run once more before its new settings meant anything. */
+    s32 key = p->pid;
+    sched_info_t *update_info = bpf_map_lookup_elem(&update_map, &key);
+    if (unlikely(update_info && update_info->prio != PRIO_CONSUMED)) {
+        target_ctx->prio = update_info->prio;
+        target_ctx->slice = update_info->slice;
+        target_ctx->expt_wait = update_info->expt_wait;
+
+        /* Only apply the cpu_kind setting when the task is not bound
+         * to a specific CPU. */
+        if (BPF_CORE_READ(p, nr_cpus_allowed) == (s32)cpu_num)
+            target_ctx->kind = update_info->kind;
+
+        target_ctx->cpu_prefer = update_info->cpu_prefer;
+        if (target_ctx->cpu_prefer == CPU_NO_PREFER) {
+            if (target_ctx->kind == FASTEST_KIND)
+                target_ctx->cpu_prefer = CPU_FAST_PREFER;
+            else if (target_ctx->kind == SLOWEST_KIND)
+                target_ctx->cpu_prefer = CPU_SLOW_PREFER;
+        }
+
+        /* The entry stays as the task's liveness marker; only its settings are
+         * retired. `update_info` points into the map, so this is the stored
+         * value, not a copy. */
+        update_info->prio = PRIO_CONSUMED;
+    }
 }
 
 void BPF_STRUCT_OPS(teddy_running, struct task_struct *p)
@@ -569,33 +599,6 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
             try_data_to_user(p, target_ctx);
         }
     }
-
-    s32 key = p->pid;
-    sched_info_t *update_info = bpf_map_lookup_elem(&update_map, &key);
-    if (unlikely(update_info && update_info->prio != PRIO_CONSUMED)) {
-        target_ctx->prio = update_info->prio;
-        target_ctx->slice = update_info->slice;
-        target_ctx->expt_wait = update_info->expt_wait;
-
-        /* Only apply the cpu_kind setting when the task is not bound
-         * to a specific CPU. */
-        if (BPF_CORE_READ(p, nr_cpus_allowed) == (s32)cpu_num)
-            target_ctx->kind = update_info->kind;
-
-        target_ctx->cpu_prefer = update_info->cpu_prefer;
-        if (target_ctx->cpu_prefer == CPU_NO_PREFER) {
-            if (target_ctx->kind == FASTEST_KIND)
-                target_ctx->cpu_prefer = CPU_FAST_PREFER;
-            else if (target_ctx->kind == SLOWEST_KIND)
-                target_ctx->cpu_prefer = CPU_SLOW_PREFER;
-        }
-
-        /* The entry stays as the task's liveness marker; only its settings are
-         * retired. `update_info` points into the map, so this is the stored
-         * value, not a copy. */
-        update_info->prio = PRIO_CONSUMED;
-    }
-
 }
 
 void BPF_STRUCT_OPS(teddy_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
@@ -619,8 +622,8 @@ clear_tracing_data:
     pid_t delay_key = p->pid;
     bpf_map_delete_elem(&sched_delay_map, &delay_key);
     /* Ends the task's liveness marker: a userspace write with BPF_EXIST fails
-     * from here on, so nothing recreates an entry that only `stopping` could
-     * consume and the task will never stop again. */
+     * from here on, so nothing recreates an entry that only `runnable` could
+     * consume and the task will never become runnable again. */
     s32 update_key = p->pid;
     bpf_map_delete_elem(&update_map, &update_key);
 }

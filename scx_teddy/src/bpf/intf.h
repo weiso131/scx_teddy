@@ -27,7 +27,7 @@ typedef signed long s64;
 #define CRITICAL_PRIO 4 // prio < 4 is critical
 #define DEFAULT_PRIO 11 // use lowest priority as default
 
-/* Marks an update_map entry whose settings `stopping` has already applied. Out
+/* Marks an update_map entry whose settings `runnable` has already applied. Out
  * of the valid priority range, so it can never be mistaken for a real setting.
  *
  * The entry itself tracks task liveness instead: init_task creates it and
