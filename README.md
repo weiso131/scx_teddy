@@ -69,6 +69,22 @@ task membership (tid, tgid, ppid, command).
 - `-k, --clusters <N>` — number of clusters (auto if omitted)
 - `--train-config <PATH>` — comm-prefix filter list (default: all tasks)
 - `--filter-tid / --filter-tgid / --filter-cmd <…>` — filter the training set
+- `--exclude-feature <NAME…>` — train without these feature columns
+
+Training ends with a set of diagnostics on the features themselves —
+near-constant and binary columns, rank correlation between features, effective
+dimensionality, silhouette against other cluster counts, and how far the split
+departs from grouping by command name. To act on what they report, drop a
+column and retrain:
+
+```bash
+python3 train.py event.csv -o model.json --exclude-feature iowait_ratio avg_sleep_ms
+```
+
+Excluding a column changes the model's feature list, so a model trained this
+way expects the same CSV as any other — scx_teddy reads the feature names from
+the model JSON and uses only those. An unknown name is rejected rather than
+ignored.
 
 ### Step 3: Write a scheduling policy
 

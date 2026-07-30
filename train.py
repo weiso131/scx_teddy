@@ -17,9 +17,14 @@ from sklearn.preprocessing import StandardScaler
 META_COLUMNS = {"tid", "tgid", "ppid", "comm", "ancestor"}
 
 
-def get_feature_columns(df):
-    """Derive feature columns from the DataFrame (all columns except metadata)."""
-    reserved = META_COLUMNS | {"label"}
+def get_feature_columns(df, exclude=None):
+    """Derive feature columns from the DataFrame (all columns except metadata).
+
+    `exclude` drops further columns without re-collecting the CSV, which is how
+    a feature the diagnostics flagged as degenerate or redundant gets tested
+    against a model trained without it.
+    """
+    reserved = META_COLUMNS | {"label"} | set(exclude or ())
     return [col for col in df.columns if col not in reserved]
 
 
@@ -294,11 +299,12 @@ def report_features(df, feature_columns, X_scaled, labels, n_clusters):
     report_comm_spread(df, labels, n_clusters)
 
 
-def train(csv_path, output_path, n_clusters=None):
+def train(csv_path, output_path, n_clusters=None, exclude_features=None):
     df = pd.read_csv(csv_path)
     print(f"Loaded {len(df)} tasks from {csv_path}")
 
-    feature_columns = get_feature_columns(df)
+    feature_columns = get_feature_columns(df, exclude_features)
+    print(f"Training on {len(feature_columns)} features: {', '.join(feature_columns)}")
     X = df[feature_columns].values
 
     # Standardize
@@ -386,9 +392,20 @@ def main():
     parser.add_argument("--train-config", default=None, metavar="PATH",
                         help="Path to train_config.config (comm prefix list). "
                              "If not given, all tasks in the CSV are used.")
+    parser.add_argument("--exclude-feature", nargs="*", default=None, metavar="NAME",
+                        help="Feature column(s) to leave out of training.")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
+
+    # Reject an unknown name rather than training on the full feature set: the
+    # run would otherwise succeed and quietly answer a different question.
+    if args.exclude_feature:
+        unknown = set(args.exclude_feature) - set(get_feature_columns(df))
+        if unknown:
+            print(f"Error: not feature column(s) in {args.csv}: {', '.join(sorted(unknown))}",
+                  file=sys.stderr)
+            sys.exit(1)
 
     # Apply filters using CSV metadata columns (no /proc access needed)
     if args.filter_tid:
@@ -420,7 +437,7 @@ def main():
     # Write filtered CSV to a temp file and train from it
     filtered_path = args.csv + ".filtered.tmp"
     df.to_csv(filtered_path, index=False)
-    train(filtered_path, args.output, args.clusters)
+    train(filtered_path, args.output, args.clusters, args.exclude_feature)
 
     import os
     os.remove(filtered_path)

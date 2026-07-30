@@ -65,6 +65,19 @@ JSON，並寫 `<model>_result.json`（每個 cluster 的成員：tid、tgid、pp
 - `-k, --clusters <N>` — cluster 數（省略則自動）
 - `--train-config <PATH>` — comm 前綴過濾清單（預設：全部任務）
 - `--filter-tid / --filter-tgid / --filter-cmd <…>` — 過濾訓練集
+- `--exclude-feature <NAME…>` — 排除這些 feature 欄位再訓練
+
+訓練結束會印一組針對 feature 本身的診斷——近乎常數與二元的欄位、feature 之間的
+等級相關、有效維度、不同 cluster 數的 silhouette，以及分群偏離名稱分群的程度。
+要照診斷結果調整，就排掉某欄重訓：
+
+```bash
+python3 train.py event.csv -o model.json --exclude-feature iowait_ratio avg_sleep_ms
+```
+
+排除欄位會改變模型的 feature 清單，但這樣訓出的模型跟其他模型吃一樣的 CSV——
+scx_teddy 從 model JSON 讀 feature 名稱，只取用列出的那些。名稱打錯會直接報錯，
+不會被忽略。
 
 ### 步驟 3：寫排程策略
 
