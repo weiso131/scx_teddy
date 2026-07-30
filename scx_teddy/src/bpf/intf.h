@@ -124,7 +124,13 @@ typedef struct target_ctx {
     u32 in_iowait_cnt;
     u32 futex_wait_cnt;
     u32 ntsync_wait_cnt;
-    u8 audio_producer;
+    /* Audio production rate, in pa_stream_write calls per second. The peak is
+     * kept rather than the mean: a thread held off the CPU writes less audio
+     * per second than it wants to, so the largest rate it ever reached is the
+     * one that reflects its actual demand. Window state below feeds it. */
+    u32 audio_rate_max;
+    u32 audio_win_cnt;
+    u64 audio_win_start;
 } target_ctx_t;
 
 typedef struct task_event {
@@ -139,7 +145,7 @@ typedef struct task_event {
     u32 in_iowait_cnt;
     u32 futex_wait_cnt;
     u32 ntsync_wait_cnt;
-    u8 audio_producer; // sticky: 1 if this task ever produced audio (see target_ctx)
+    u32 audio_rate_max; // peak pa_stream_write calls/sec (see target_ctx)
 } task_event_t;
 
 #define CONFIG_STOP_RINGBUF 0

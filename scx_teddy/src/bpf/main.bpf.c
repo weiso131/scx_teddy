@@ -112,6 +112,13 @@ static __always_inline u64 ewma_decay(u64 old, u64 sample)
 
 #define MIN_SEND_INTERVAL 100000000
 
+#define NS_PER_SEC 1000000000ULL
+
+/* Window the audio rate is measured over. Independent of the event flush
+ * interval, which varies with how often the task runs — a rate divided by that
+ * would shrink for exactly the tasks that are being held off the CPU. */
+#define AUDIO_WINDOW_NS NS_PER_SEC
+
 struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
@@ -223,7 +230,7 @@ static void try_data_to_user(struct task_struct *p, target_ctx_t *target_ctx)
     e->in_iowait_cnt = target_ctx->in_iowait_cnt;
     e->futex_wait_cnt = target_ctx->futex_wait_cnt;
     e->ntsync_wait_cnt = target_ctx->ntsync_wait_cnt;
-    e->audio_producer = target_ctx->audio_producer;
+    e->audio_rate_max = target_ctx->audio_rate_max;
 
     // Submit to ring buffer
     bpf_ringbuf_submit(e, 0);
@@ -718,7 +725,23 @@ int BPF_UPROBE(trace_pa_stream_write)
 {
     struct task_struct *p = bpf_get_current_task_btf();
     target_ctx_t *target_ctx = get_target_storage(p);
-    if (target_ctx)
-        target_ctx->audio_producer = 1;
+    if (!target_ctx)
+        return 0;
+
+    u64 now = bpf_ktime_get_ns();
+
+    if (unlikely(target_ctx->audio_win_start == 0))
+        target_ctx->audio_win_start = now;
+
+    u64 elapsed = now - target_ctx->audio_win_start;
+    if (elapsed >= AUDIO_WINDOW_NS) {
+        u32 rate = (u32)((u64)target_ctx->audio_win_cnt * NS_PER_SEC / elapsed);
+        if (rate > target_ctx->audio_rate_max)
+            target_ctx->audio_rate_max = rate;
+        target_ctx->audio_win_start = now;
+        target_ctx->audio_win_cnt = 0;
+    }
+    target_ctx->audio_win_cnt++;
+
     return 0;
 }
