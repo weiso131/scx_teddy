@@ -33,6 +33,15 @@ pub struct TaskStats {
     /// task's whole life: `update` overwrites rather than accumulating.
     pub audio_rate_max: u32,
 
+    /// Peak vkQueuePresentKHR / vkQueueSubmit calls per second. Unlike every
+    /// other field here these do not come from the ringbuf: the Vulkan layer
+    /// measures them and they are copied in from shared memory once per classify
+    /// cycle (`refresh_vk_rates` in main.rs), so `update` leaves them alone.
+    /// 0 means the layer reported nothing for this task — which covers both a
+    /// task that makes no Vulkan calls and one that found the table full.
+    pub present_rate_max: u32,
+    pub submit_rate_max: u32,
+
     pub event_count: u64,
     /// Union-Find ancestor pointer toward the specialization root.
     /// Initialised from the task's real parent (carried in TaskEvent.parent
@@ -90,6 +99,8 @@ impl TaskStats {
             futex_wait_cnt: 0,
             ntsync_wait_cnt: 0,
             audio_rate_max: 0,
+            present_rate_max: 0,
+            submit_rate_max: 0,
 
             event_count: 0,
             ancestor,

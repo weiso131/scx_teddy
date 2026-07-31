@@ -27,6 +27,7 @@ mod predictor;
 mod predictors;
 mod task_stats;
 mod topology;
+mod vk_trace;
 
 use crate::audio::Audio;
 
@@ -323,6 +324,27 @@ fn collect_data(
         })
         .collect();
     write_csv(output, &rows, collector)
+}
+
+/// Copy the Vulkan layer's per-thread call rates into the tasks they belong to.
+///
+/// These are the only features that do not arrive over the ringbuf, so nothing
+/// in `process_event` maintains them: this runs once per cycle, before the
+/// features are read. Tasks the layer says nothing about keep whatever they
+/// had, which is 0 unless they were traced earlier — the rates are high-water
+/// marks, so a thread that stops presenting keeps the peak it reached.
+///
+/// A missing shm object (no traced game) yields an empty table and leaves every
+/// task untouched.
+fn refresh_vk_rates(stats_map: &HashMap<i32, RefCell<TaskStats>>) -> Result<()> {
+    for r in vk_trace::read_tid_rates()? {
+        if let Some(cell) = stats_map.get(&r.tid) {
+            let mut ts = cell.borrow_mut();
+            ts.present_rate_max = r.present_rate;
+            ts.submit_rate_max = r.submit_rate;
+        }
+    }
+    Ok(())
 }
 
 /// Advance one task's Union-Find ancestor pointer by ONE halving step
@@ -875,6 +897,10 @@ fn main() -> Result<()> {
             let key = 0u32.to_ne_bytes();
             scheduler_config.update(&key, &1u32.to_ne_bytes(), MapFlags::ANY)?;
 
+            // Both branches below read features, so refresh the ones that come
+            // from the Vulkan layer rather than the ringbuf first.
+            refresh_vk_rates(&stats.borrow())?;
+
             if let Some(default_set) = &default_set {
                 run_classify_cycle(&stats.borrow(), update_map,
                     default_set, target_set.as_ref(), args.min_events,
@@ -903,6 +929,7 @@ fn main() -> Result<()> {
 
     // Flush the CSV on shutdown (collect mode).
     if collect_mode {
+        refresh_vk_rates(&stats.borrow())?;
         let n = collect_data(&stats.borrow(), &args.output,
             args.min_events, target_ppid.get(), &*collector)?;
         log!(logger, "CSV written: {} rows", n);
