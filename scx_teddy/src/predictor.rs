@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use std::fs;
 use libbpf_rs::{MapCore, MapFlags};
-use crate::predictors::kmeans::{KMeansCollector, KMeansModel, KMeansPredictor};
-use crate::predictors::expt_tolerance::{ExptToleranceCollector, ExptToleranceModel, ExptTolerancePredictor};
+use crate::predictors::kmeans::{KMeansModel, KMeansPredictor};
+use crate::predictors::expt_tolerance::{ExptToleranceModel, ExptTolerancePredictor};
 use crate::task_stats::TaskStats;
 
 /// The scheduling parameters a predictor decides for one task. Mirrors the BPF
@@ -84,29 +84,6 @@ pub trait Predictor: Send + Sync {
     /// Check the predictor's config against the machine topology. Called once
     /// the CPU topology is known (which is after loading).
     fn validate(&self, cpu_kind_num: u8) -> Result<()>;
-}
-
-pub trait Collector: Send + Sync {
-    /// Returns (name, value) pairs for all features.
-    /// The order here defines the CSV column order and feature vector order.
-    #[allow(dead_code)]
-    fn named_stats(&self, stats: &TaskStats) -> Vec<(&'static str, f64)>;
-
-    /// Returns feature values as a Vec (order matches named_stats).
-    fn feature_values(&self, stats: &TaskStats) -> Vec<f64>;
-
-    /// Returns feature names (order matches feature_values).
-    fn feature_names(&self) -> Vec<&'static str>;
-}
-
-/// Load a collector by algorithm name. Mirrors `load_predictor` so the feature
-/// set used for collection can be switched the same way the predictor is.
-pub fn load_collector(algorithm: &str) -> Result<Box<dyn Collector>> {
-    match algorithm {
-        "kmeans" => Ok(Box::new(KMeansCollector)),
-        "expt_tolerance" => Ok(Box::new(ExptToleranceCollector)),
-        _ => bail!("Unsupported algorithm: {}", algorithm),
-    }
 }
 
 /// Load a predictor from a JSON model file plus the config that interprets its

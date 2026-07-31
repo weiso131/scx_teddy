@@ -1,54 +1,8 @@
 use anyhow::Result;
 use serde::Deserialize;
-use crate::predictor::{Collector, Predictor, SchedDecision, write_sched_info};
-use crate::predictors::helper::{KMeansCore, SchedConfig};
+use crate::predictor::{Predictor, SchedDecision, write_sched_info};
+use crate::predictors::helper::{self, KMeansCore, SchedConfig};
 use crate::task_stats::TaskStats;
-
-pub struct KMeansCollector;
-
-impl KMeansCollector {
-    /// Returns (name, value) pairs for all features.
-    /// The order here defines the CSV column order and feature vector order.
-    pub fn named_stats(stats: &TaskStats) -> Vec<(&'static str, f64)> {
-        vec![
-            ("runtime_ms", stats.avg_runtime_ms()),
-            ("runtime_cv", stats.runtime_cv()),
-            ("avg_sleep_ms", stats.avg_sleep_ms()),
-            ("sleep_cv", stats.sleep_cv()),
-            ("iowait_ratio", stats.sleep_base_ratio(stats.in_iowait_cnt)),
-            ("futex_wait_ratio", stats.sleep_base_ratio(stats.futex_wait_cnt)),
-            ("ntsync_wait_ratio", stats.sleep_base_ratio(stats.ntsync_wait_cnt)),
-            ("audio_rate", stats.audio_rate_max as f64),
-            ("present_rate", stats.present_rate_max as f64),
-            ("submit_rate", stats.submit_rate_max as f64),
-            ("runtime_ratio", stats.avg_runtime_ms() / (stats.avg_runtime_ms() + stats.avg_sleep_ms())),
-        ]
-    }
-
-    /// Returns feature values as a Vec (order matches named_stats).
-    pub fn feature_values(stats: &TaskStats) -> Vec<f64> {
-        Self::named_stats(stats).into_iter().map(|(_, v)| v).collect()
-    }
-
-    /// Returns feature names (order matches feature_values).
-    pub fn feature_names() -> Vec<&'static str> {
-        Self::named_stats(&TaskStats::default()).into_iter().map(|(n, _)| n).collect()
-    }
-}
-
-impl Collector for KMeansCollector {
-    fn named_stats(&self, stats: &TaskStats) -> Vec<(&'static str, f64)> {
-        Self::named_stats(stats)
-    }
-
-    fn feature_values(&self, stats: &TaskStats) -> Vec<f64> {
-        Self::feature_values(stats)
-    }
-
-    fn feature_names(&self) -> Vec<&'static str> {
-        Self::feature_names()
-    }
-}
 
 #[derive(Deserialize)]
 struct KMeansScaler {
@@ -81,7 +35,7 @@ impl KMeansPredictor {
             model.centroids,
             model.scaler.mean,
             model.scaler.std,
-            &KMeansCollector::feature_names(),
+            &helper::feature_names(),
         )?;
         let config = SchedConfig::from_path(config_path)?;
 
@@ -105,9 +59,7 @@ impl Predictor for KMeansPredictor {
         }
         stats.need_update = 0;
 
-        let named_stats = KMeansCollector::named_stats(stats);
-        let raw_features: Vec<f64> = named_stats.iter().map(|(_, v)| *v).collect();
-        let cluster = self.core.nearest_cluster(&raw_features);
+        let cluster = self.core.nearest_cluster(&helper::feature_values(stats));
 
         let cluster_cfg = self.config.cluster_or_default(cluster);
 

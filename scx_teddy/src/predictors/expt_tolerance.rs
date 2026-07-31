@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use crate::predictor::{Collector, Predictor, SchedDecision, write_sched_info};
-use crate::predictors::helper::{ClusterSchedConfig, KMeansCore, SchedConfig};
+use crate::predictor::{Predictor, SchedDecision, write_sched_info};
+use crate::predictors::helper::{self, ClusterSchedConfig, KMeansCore, SchedConfig};
 use crate::predictors::expt_tolerance::metric::Metric;
 use crate::predictors::expt_tolerance::metrics::game_fps::GameFps;
 use crate::task_stats::TaskStats;
@@ -511,54 +511,6 @@ fn to_expt_params(cfg: &ClusterSchedConfig) -> ExptParams {
     }
 }
 
-/// Feature extraction for this predictor. Same feature set as the kmeans
-/// predictor, kept as its own copy so the two can diverge.
-pub struct ExptToleranceCollector;
-
-impl ExptToleranceCollector {
-    /// Returns (name, value) pairs for all features.
-    /// The order here defines the CSV column order and feature vector order.
-    pub fn named_stats(stats: &TaskStats) -> Vec<(&'static str, f64)> {
-        vec![
-            ("runtime_ms", stats.avg_runtime_ms()),
-            ("runtime_cv", stats.runtime_cv()),
-            ("avg_sleep_ms", stats.avg_sleep_ms()),
-            ("sleep_cv", stats.sleep_cv()),
-            ("iowait_ratio", stats.sleep_base_ratio(stats.in_iowait_cnt)),
-            ("futex_wait_ratio", stats.sleep_base_ratio(stats.futex_wait_cnt)),
-            ("ntsync_wait_ratio", stats.sleep_base_ratio(stats.ntsync_wait_cnt)),
-            ("audio_rate", stats.audio_rate_max as f64),
-            ("present_rate", stats.present_rate_max as f64),
-            ("submit_rate", stats.submit_rate_max as f64),
-            ("runtime_ratio", stats.avg_runtime_ms() / (stats.avg_runtime_ms() + stats.avg_sleep_ms())),
-        ]
-    }
-
-    /// Returns feature values as a Vec (order matches named_stats).
-    pub fn feature_values(stats: &TaskStats) -> Vec<f64> {
-        Self::named_stats(stats).into_iter().map(|(_, v)| v).collect()
-    }
-
-    /// Returns feature names (order matches feature_values).
-    pub fn feature_names() -> Vec<&'static str> {
-        Self::named_stats(&TaskStats::default()).into_iter().map(|(n, _)| n).collect()
-    }
-}
-
-impl Collector for ExptToleranceCollector {
-    fn named_stats(&self, stats: &TaskStats) -> Vec<(&'static str, f64)> {
-        Self::named_stats(stats)
-    }
-
-    fn feature_values(&self, stats: &TaskStats) -> Vec<f64> {
-        Self::feature_values(stats)
-    }
-
-    fn feature_names(&self) -> Vec<&'static str> {
-        Self::feature_names()
-    }
-}
-
 #[derive(Deserialize)]
 struct KMeansScaler {
     mean: Vec<f64>,
@@ -603,7 +555,7 @@ impl ExptTolerancePredictor {
             model.centroids,
             model.scaler.mean,
             model.scaler.std,
-            &ExptToleranceCollector::feature_names(),
+            &helper::feature_names(),
         )?;
         let config = SchedConfig::from_path(config_path)?;
 
@@ -672,9 +624,7 @@ impl Predictor for ExptTolerancePredictor {
         }
         stats.need_update = 0;
 
-        let named_stats = ExptToleranceCollector::named_stats(stats);
-        let raw_features: Vec<f64> = named_stats.iter().map(|(_, v)| *v).collect();
-        let cluster = self.core.nearest_cluster(&raw_features);
+        let cluster = self.core.nearest_cluster(&helper::feature_values(stats));
 
         let cluster_cfg = self.config.cluster_or_default(cluster);
 
@@ -688,11 +638,7 @@ impl Predictor for ExptTolerancePredictor {
             epoch: 0,
         };
 
-        let runtime_ratio = named_stats
-            .iter()
-            .find(|(n, _)| *n == "runtime_ratio")
-            .map(|(_, v)| *v)
-            .unwrap_or(0.0);
+        let runtime_ratio = helper::feature_value(stats, "runtime_ratio");
 
         // Accumulate the cluster's runtime_ratio (for cluster selection), keep
         // the cluster membership sets current, and decide whether the experiment

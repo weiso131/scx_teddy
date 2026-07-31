@@ -1,12 +1,60 @@
 //! Shared building blocks for the k-means-based predictors (`kmeans`,
-//! `expt_tolerance`). The two predictors keep their own `Collector` (the feature
-//! set is expected to diverge) and their own model/scaler structs, but the parts
-//! that are genuinely k-means — the scheduling config format and the "nearest
-//! centroid" classifier — live here so they are defined once.
+//! `expt_tolerance`): the feature set, the scheduling config format, and the
+//! "nearest centroid" classifier, each defined once.
+//!
+//! The two predictors used to carry a copy of the feature list each, on the
+//! theory that they would diverge. They never did — every feature added had to
+//! be written twice, and a model naming one the other lacked would only fail at
+//! load time.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use crate::task_stats::TaskStats;
+
+/// Every feature a model may train on, in the order they appear as CSV columns.
+///
+/// The single definition of the feature set: adding one here is all it takes for
+/// both predictors and the collect-mode CSV to carry it. A model selects the
+/// subset it was trained on by name (see `KMeansCore::from_model_parts`), so
+/// this list may grow without invalidating models that do not mention the new
+/// column.
+const FEATURES: &[(&str, fn(&TaskStats) -> f64)] = &[
+    ("runtime_ms", |s| s.avg_runtime_ms()),
+    ("runtime_cv", |s| s.runtime_cv()),
+    ("avg_sleep_ms", |s| s.avg_sleep_ms()),
+    ("sleep_cv", |s| s.sleep_cv()),
+    ("iowait_ratio", |s| s.sleep_base_ratio(s.in_iowait_cnt)),
+    ("futex_wait_ratio", |s| s.sleep_base_ratio(s.futex_wait_cnt)),
+    ("ntsync_wait_ratio", |s| s.sleep_base_ratio(s.ntsync_wait_cnt)),
+    ("audio_rate", |s| s.audio_rate_max as f64),
+    ("present_rate", |s| s.present_rate_max as f64),
+    ("submit_rate", |s| s.submit_rate_max as f64),
+    ("runtime_ratio", |s| {
+        s.avg_runtime_ms() / (s.avg_runtime_ms() + s.avg_sleep_ms())
+    }),
+];
+
+/// Feature names, in the order `feature_values` returns them.
+pub fn feature_names() -> Vec<&'static str> {
+    FEATURES.iter().map(|(n, _)| *n).collect()
+}
+
+/// Every feature's value for one task, in `feature_names` order.
+pub fn feature_values(stats: &TaskStats) -> Vec<f64> {
+    FEATURES.iter().map(|(_, f)| f(stats)).collect()
+}
+
+/// One feature by name, or 0.0 if there is no such feature. For the few callers
+/// that want a single named value rather than the whole vector.
+pub fn feature_value(stats: &TaskStats, name: &str) -> f64 {
+    FEATURES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, f)| f(stats))
+        .unwrap_or(0.0)
+}
 
 /// Per-cluster scheduling parameters, as read from the config JSON.
 #[derive(Debug, Deserialize, Serialize, Clone)]

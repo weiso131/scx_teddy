@@ -33,7 +33,8 @@ use crate::audio::Audio;
 
 use task_stats::TaskStats;
 use crate::task_stats::TaskEvent;
-use crate::predictor::{Collector, SchedDecision, load_collector};
+use crate::predictor::SchedDecision;
+use crate::predictors::helper;
 
 mod bpf_skel {
     include!(concat!(env!("OUT_DIR"), "/bpf_skel.rs"));
@@ -243,8 +244,8 @@ fn process_event(
     0
 }
 
-fn csv_header(collector: &dyn Collector) -> String {
-    let feature_names = collector.feature_names();
+fn csv_header() -> String {
+    let feature_names = helper::feature_names();
     let mut header = String::from("tid,tgid,ancestor,comm");
     for name in &feature_names {
         header.push(',');
@@ -278,11 +279,11 @@ fn read_proc_comm(tid: i32) -> String {
 /// Format one task's stats into a CSV row. `ancestor` is the Union-Find
 /// root from `climb_to_root` (1 = not a target descendant, or the target
 /// PPID), not the real parent — so it comes from TaskStats, not /proc.
-fn task_csv_row(tid: i32, task_stats: &TaskStats, collector: &dyn Collector) -> String {
+fn task_csv_row(tid: i32, task_stats: &TaskStats) -> String {
     let tgid = read_proc_field(tid, "Tgid")
         .map(|v| v.to_string()).unwrap_or_default();
     let comm = read_proc_comm(tid);
-    let values: Vec<String> = collector.feature_values(task_stats).iter()
+    let values: Vec<String> = helper::feature_values(task_stats).iter()
         .map(|v| format!("{}", v)).collect();
     format!("{},{},{},{},{}", tid, tgid, task_stats.ancestor, comm, values.join(","))
 }
@@ -290,10 +291,10 @@ fn task_csv_row(tid: i32, task_stats: &TaskStats, collector: &dyn Collector) -> 
 /// Write `rows` to a fresh CSV at `path`, header first. The output path is
 /// checked for non-existence at startup, so this is a plain write — no merge
 /// with any prior file. Returns the number of rows written.
-fn write_csv(path: &str, rows: &[(i32, String)], collector: &dyn Collector) -> Result<usize> {
+fn write_csv(path: &str, rows: &[(i32, String)]) -> Result<usize> {
     let mut file = std::fs::File::create(path)
         .context("Failed to create output CSV")?;
-    writeln!(file, "{}", csv_header(collector))
+    writeln!(file, "{}", csv_header())
         .context("Failed to write CSV header")?;
     for (_, row) in rows {
         writeln!(file, "{}", row)
@@ -310,20 +311,19 @@ fn collect_data(
     output: &str,
     min_events: u64,
     target_ppid: i32,
-    collector: &dyn Collector,
 ) -> Result<usize> {
     let rows: Vec<(i32, String)> = stats_map.iter()
         .filter_map(|(&tid, cell)| {
             let mut ts = cell.borrow_mut();
             if ts.exit == 0 && ts.event_count >= min_events {
                 climb_to_root(&mut ts, stats_map, target_ppid);
-                Some((tid, task_csv_row(tid, &ts, collector)))
+                Some((tid, task_csv_row(tid, &ts)))
             } else {
                 None
             }
         })
         .collect();
-    write_csv(output, &rows, collector)
+    write_csv(output, &rows)
 }
 
 /// Copy the Vulkan layer's per-thread call rates into the tasks they belong to.
@@ -696,8 +696,6 @@ fn main() -> Result<()> {
     // log! call goes to a file.
     let logger = Rc::new(RefCell::new(Logger::new(args.verbose)));
 
-    let collector = load_collector("kmeans")?;
-
     // Load the default model + config for classify mode (required). The target
     // set is optional and may also be set/changed later via the control files.
     let default_set = if args.mode == "classify" {
@@ -909,7 +907,7 @@ fn main() -> Result<()> {
                 // Collect mode writes the CSV every cycle only with this flag;
                 // otherwise it is flushed once on shutdown.
                 let n = collect_data(&stats.borrow(), &args.output,
-                    args.min_events, target_ppid.get(), &*collector)?;
+                    args.min_events, target_ppid.get())?;
                 log!(logger, "CSV written: {} rows", n);
             }
 
@@ -931,7 +929,7 @@ fn main() -> Result<()> {
     if collect_mode {
         refresh_vk_rates(&stats.borrow())?;
         let n = collect_data(&stats.borrow(), &args.output,
-            args.min_events, target_ppid.get(), &*collector)?;
+            args.min_events, target_ppid.get())?;
         log!(logger, "CSV written: {} rows", n);
     }
 
