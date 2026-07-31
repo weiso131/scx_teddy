@@ -87,19 +87,18 @@ scx_teddy 從 model JSON 讀 feature 名稱，只取用列出的那些。名稱�
 ```json
 {
   "clusters": {
-    "0": { "prio": 0,  "slice_mode": "fixed",    "slice_ns": 1500000, "cpu_kind": 1, "cpu_prefer": 1 },
-    "1": { "prio": 2,  "slice_mode": "fixed",    "slice_ns": 3000000 },
-    "6": { "prio": 11, "slice_mode": "adaptive", "slice_sigma": 1.0,  "cpu_prefer": 2 }
+    "0": { "prio": 0,  "slice_ns": 1500000, "cpu_kind": 1, "cpu_prefer": 1 },
+    "1": { "prio": 2,  "slice_ns": 3000000 },
+    "6": { "prio": 11, "slice_ns": 100000,  "cpu_prefer": 2 }
   },
-  "default": { "prio": 11, "slice_mode": "fixed", "slice_ns": 100000 }
+  "default": { "prio": 11, "slice_ns": 100000 }
 }
 ```
 
 - **prio** — 優先權階層，`0` = 最高、`11` = 最低（共 12 階）。dispatch 從 `prio 0`
   往下。`prio < 4` 視為 *critical*：這些任務在喚醒時會主動找 idle CPU（延遲最低）；
   `prio >= 4` 只是 enqueue 排隊。
-- **slice_mode** — `fixed`（`slice_ns`，下限 100000）或 `adaptive`（`slice_sigma`：
-  時間片隨任務平均執行時間與其變異度縮放）。
+- **slice_ns** — 時間片，單位奈秒，下限 100000。
 - **cpu_kind** *(大小核機器)* — `0`（預設）= 共用，任何核種都可跑；否則 1-based，
   `1` = 最快核種（P-core），數字越大越慢（E-core / tier-N）。scx_teddy 啟動時從
   cpufreq 偵測核種並印出有效範圍。

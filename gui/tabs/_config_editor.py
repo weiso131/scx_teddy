@@ -65,8 +65,8 @@ def _cpu_kind_options(groups: list) -> list[str]:
 def _row_from_entry(cluster: str, entry: dict | None, groups: list) -> dict:
     """One editor row. `entry` is a cluster's config dict (from a loaded file)
     or None to fall back to the GUI defaults. Only the fields the editor shows
-    are pulled out; slice_mode/extra keys are dropped (the editor is fixed-slice
-    only, so re-serializing always writes a clean fixed entry).
+    are pulled out; extra keys are dropped, so re-serializing always writes a
+    clean entry.
 
     cpu_kind and cpu_prefer are held as labelled strings (so the table shows
     dropdowns) and mapped back to ints on save."""

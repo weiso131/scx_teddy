@@ -94,11 +94,11 @@ entry for clusters not listed (and for tasks scx_teddy can't place):
 ```json
 {
   "clusters": {
-    "0": { "prio": 0,  "slice_mode": "fixed",    "slice_ns": 1500000, "cpu_kind": 1, "cpu_prefer": 1 },
-    "1": { "prio": 2,  "slice_mode": "fixed",    "slice_ns": 3000000 },
-    "6": { "prio": 11, "slice_mode": "adaptive", "slice_sigma": 1.0,  "cpu_prefer": 2 }
+    "0": { "prio": 0,  "slice_ns": 1500000, "cpu_kind": 1, "cpu_prefer": 1 },
+    "1": { "prio": 2,  "slice_ns": 3000000 },
+    "6": { "prio": 11, "slice_ns": 100000,  "cpu_prefer": 2 }
   },
-  "default": { "prio": 11, "slice_mode": "fixed", "slice_ns": 100000 }
+  "default": { "prio": 11, "slice_ns": 100000 }
 }
 ```
 
@@ -106,8 +106,7 @@ entry for clusters not listed (and for tasks scx_teddy can't place):
   dispatched from `prio 0` down. `prio < 4` is treated as *critical*: those tasks
   get an active idle-CPU search on wakeup (lowest latency); `prio >= 4` are just
   enqueued.
-- **slice_mode** — `fixed` (`slice_ns`, floored at 100000) or `adaptive`
-  (`slice_sigma`: slice scales with the task's mean runtime and its variability).
+- **slice_ns** — time slice in nanoseconds, floored at 100000.
 - **cpu_kind** *(hybrid machines)* — `0` (default) = shared, runnable on any CPU
   kind; otherwise 1-based, `1` = fastest tier (P-core), higher = slower (E-core /
   tier-N). scx_teddy discovers the kinds from cpufreq at startup and prints the

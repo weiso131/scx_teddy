@@ -8,18 +8,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// How a cluster's time slice is derived. Part of `ClusterSchedConfig`.
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(tag = "slice_mode")]
-pub enum SliceConfig {
-    /// slice = avg_runtime_ns + sigma * stddev_runtime_ns
-    #[serde(rename = "adaptive")]
-    Adaptive { slice_sigma: f64 },
-    /// slice = fixed value in ns
-    #[serde(rename = "fixed")]
-    Fixed { slice_ns: u64 },
-}
-
 /// Per-cluster scheduling parameters, as read from the config JSON.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ClusterSchedConfig {
@@ -34,31 +22,8 @@ pub struct ClusterSchedConfig {
     /// cpu_kind when the kind is the fastest/slowest tier.
     #[serde(default)]
     pub cpu_prefer: u8,
-    #[serde(flatten)]
-    pub slice: SliceConfig,
-}
-
-impl ClusterSchedConfig {
-    /// Compute the slice in ns for a task given its named runtime stats.
-    pub fn compute_slice_ns(&self, named_stats: &[(&str, f64)]) -> u64 {
-        match &self.slice {
-            SliceConfig::Adaptive { slice_sigma } => {
-                let lookup = |name: &str| -> f64 {
-                    named_stats.iter()
-                        .find(|(n, _)| *n == name)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.0)
-                };
-                let avg_ms = lookup("runtime_ms");
-                let cv = lookup("runtime_cv");
-                let avg_ns = avg_ms * 1_000_000.0;
-                let std_ns = avg_ms * cv * 1_000_000.0;
-                let slice = avg_ns + slice_sigma * std_ns;
-                (slice.max(1000.0)) as u64 // at least 1us
-            }
-            SliceConfig::Fixed { slice_ns } => *slice_ns,
-        }
-    }
+    /// Time slice in ns.
+    pub slice_ns: u64,
 }
 
 /// The whole scheduling config: per-cluster entries keyed by cluster id (as a

@@ -320,14 +320,14 @@ def make_cluster_entry(prio: int = CONFIG_DEFAULT_PRIO,
                        slice_ns: int = CONFIG_DEFAULT_SLICE_NS,
                        cpu_kind: int = CONFIG_DEFAULT_CPU_KIND,
                        cpu_prefer: int = CONFIG_DEFAULT_CPU_PREFER) -> dict:
-    """One cluster's scheduling entry in the fixed-slice shape scx_teddy reads:
-    {"prio", "slice_mode":"fixed", "slice_ns", "cpu_kind", "cpu_prefer"}.
+    """One cluster's scheduling entry in the shape scx_teddy reads:
+    {"prio", "slice_ns", "cpu_kind", "cpu_prefer"}.
 
     slice_ns is floored at CONFIG_DEFAULT_SLICE_NS (100us): anything smaller is
     not what the scheduler actually grants in practice, so a smaller value would
     silently mislead. We clamp at the single point every saved config flows
     through rather than only in the editor widget."""
-    return {"prio": int(prio), "slice_mode": "fixed",
+    return {"prio": int(prio),
             "slice_ns": max(int(slice_ns), CONFIG_DEFAULT_SLICE_NS),
             "cpu_kind": int(cpu_kind),
             "cpu_prefer": int(cpu_prefer)}

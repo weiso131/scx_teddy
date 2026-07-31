@@ -116,7 +116,7 @@ impl Predictor for KMeansPredictor {
             prio: cluster_cfg.prio,
             cpu_kind: cluster_cfg.cpu_kind,
             cpu_prefer: cluster_cfg.cpu_prefer,
-            slice_ns: cluster_cfg.compute_slice_ns(&named_stats),
+            slice_ns: cluster_cfg.slice_ns,
             expt_wait: 0,
             epoch: 0,
         };

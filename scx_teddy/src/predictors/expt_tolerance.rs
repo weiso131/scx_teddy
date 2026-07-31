@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use crate::predictor::{Collector, Predictor, SchedDecision, write_sched_info};
-use crate::predictors::helper::{ClusterSchedConfig, KMeansCore, SchedConfig, SliceConfig};
+use crate::predictors::helper::{ClusterSchedConfig, KMeansCore, SchedConfig};
 use crate::predictors::expt_tolerance::metric::Metric;
 use crate::predictors::expt_tolerance::metrics::game_fps::GameFps;
 use crate::task_stats::TaskStats;
@@ -56,9 +56,6 @@ const MEASURE_SEC_MAX: u32 = 20;
 /// intf.h (`PRIORITY_NUM - 1`); a prio past the BPF side's range would land
 /// tasks in a DSQ that does not exist.
 const MAX_PRIO: i32 = 11;
-/// Fixed slice used while experimenting when the cluster's config is adaptive:
-/// the experiment thread has no per-task stats to compute an adaptive slice.
-const EXPT_FIXED_SLICE_NS: u64 = 100 * 1000; // 100us, mirrors DEFAULT_SLICE
 
 /// Per-cluster experiment progress. Index into `ExptState::clusters` is the
 /// cluster id.
@@ -111,8 +108,7 @@ impl ClusterExpt {
 
 /// The scheduling parameters the experiment thread writes for the tids under
 /// test — a snapshot of the cluster-under-test's config, minus `expt_wait`
-/// (which the experiment sets/clears itself). Slice is fixed here: the
-/// experiment thread has no per-task stats to recompute an adaptive slice.
+/// (which the experiment sets/clears itself)
 #[derive(Clone)]
 struct ExptParams {
     prio: i32,
@@ -505,18 +501,13 @@ fn finish_calibration(state: &Arc<Mutex<ExptState>>, config: &SchedConfig, confi
     }
 }
 
-/// Snapshot a cluster's config as `ExptParams` for the experiment thread. An
-/// adaptive slice has no per-task stats here, so it falls back to a fixed slice.
+/// Snapshot a cluster's config as `ExptParams` for the experiment thread.
 fn to_expt_params(cfg: &ClusterSchedConfig) -> ExptParams {
-    let slice_ns = match &cfg.slice {
-        SliceConfig::Adaptive { .. } => EXPT_FIXED_SLICE_NS,
-        SliceConfig::Fixed { slice_ns } => *slice_ns,
-    };
     ExptParams {
         prio: cfg.prio,
         cpu_kind: cfg.cpu_kind,
         cpu_prefer: cfg.cpu_prefer,
-        slice_ns,
+        slice_ns: cfg.slice_ns,
     }
 }
 
@@ -692,7 +683,7 @@ impl Predictor for ExptTolerancePredictor {
             prio: cluster_cfg.prio,
             cpu_kind: cluster_cfg.cpu_kind,
             cpu_prefer: cluster_cfg.cpu_prefer,
-            slice_ns: cluster_cfg.compute_slice_ns(&named_stats),
+            slice_ns: cluster_cfg.slice_ns,
             expt_wait: 0,
             epoch: 0,
         };
