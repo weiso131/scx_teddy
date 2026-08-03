@@ -43,10 +43,6 @@ const EXPT_WAIT_START: u64 = 1000; // ns
 const MAX_WAIT_MULTIPLE: i32 = 21; // 1000 << 20 ≈ 1.049s
 /// How many before/delayed/after rounds to run per `expt_wait` value.
 const EXPT_ROUNDS: u32 = 5;
-/// Total percentage of the metric an `expt_wait` may cost across its rounds
-/// before it counts as "bad". Summing the drops rather than counting bad rounds
-/// lets one ruinous round and a run of mild ones both add up to a verdict.
-const DROP_SUM_THRESHOLD: f64 = 20.0;
 /// Window length (seconds) a cluster's measurements start at.
 const MEASURE_SEC_START: u32 = 1;
 /// Longest window to grow to while chasing a fresh delay sample. Bounds how long
@@ -335,7 +331,7 @@ fn experiment_loop(
         // round would re-pay the same lengthening.
         let mut measure_sec = MEASURE_SEC_START;
         for _ in 0..MAX_WAIT_MULTIPLE {
-            let mut drop_sum = 0.0;
+            let mut drop_sum = <GameFps as Metric>::Drop::default();
             // Largest delay actually measured across this value's rounds.
             let mut max_real_delay = 0u64;
             for _ in 0..EXPT_ROUNDS {
@@ -366,18 +362,17 @@ fn experiment_loop(
 
                 eprintln!(
                     "[expt] cluster {cluster}: expt_wait={expt_wait} epoch={epoch} real_delay={} ns \
-                     drop={drop:.1}% (before_fps={:.1} delayed_fps={:.1} after_fps={:.1})",
+                     drop=({drop})",
                     real_delay.map_or("n/a".to_string(), |d| d.to_string()),
-                    before.fps, delayed.fps, after.fps
                 );
             }
 
             // A bad value ends the search: good_expt_wait already holds the last
             // OK value. Otherwise record this value as good and double it.
-            if drop_sum >= DROP_SUM_THRESHOLD {
+            if GameFps::is_bad(&drop_sum) {
                 eprintln!(
                     "[expt] cluster {cluster}: expt_wait={expt_wait} bad \
-                     (drop_sum={drop_sum:.1}%) -> done"
+                     (drop_sum={drop_sum}) -> done"
                 );
                 break;
             }

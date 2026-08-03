@@ -20,10 +20,17 @@
 
 use anyhow::{Result, anyhow};
 use std::ffi::CString;
+use std::fmt;
+use std::ops::AddAssign;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 use crate::predictors::expt_tolerance::metric::Metric;
+
+/// Total percentage of the framerate an `expt_wait` may cost across its rounds
+/// before it counts as "bad". Summing the drops rather than counting bad rounds
+/// lets one ruinous round and a run of mild ones both add up to a verdict.
+const DROP_SUM_THRESHOLD: f64 = 20.0;
 
 /// Must match `FpsShm` in the layer's `game_fps/fps_shm.h` — both sides agree
 /// on this layout.
@@ -44,6 +51,25 @@ pub struct GameFps {
     pub min_frametime_ms: f64,
     pub max_frametime_ms: f64,
     pub frame_count: u64,
+}
+
+/// What the injected delay cost the game, summed over an `expt_wait`'s rounds.
+/// Currently the framerate percentage alone.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GameDrop {
+    pub fps_percent: f64,
+}
+
+impl AddAssign for GameDrop {
+    fn add_assign(&mut self, rhs: Self) {
+        self.fps_percent += rhs.fps_percent;
+    }
+}
+
+impl fmt::Display for GameDrop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "fps {:.1}%", self.fps_percent)
+    }
 }
 
 /// The mapping lives for the whole process, so map it once and share it. The
@@ -170,6 +196,8 @@ fn futex_wait(word: &AtomicU32, expected: u32) {
 }
 
 impl Metric for GameFps {
+    type Drop = GameDrop;
+
     fn measure(secs: u32) -> Result<Self> {
         // 0 is the protocol's "idle" value, so it cannot request a window; the
         // layer would never clear it and we would park forever.
@@ -201,7 +229,7 @@ impl Metric for GameFps {
     /// whichever undelayed window flattered it more: a drop only counts as far
     /// as it holds against both sides, so a game that was already sliding into a
     /// heavier scene does not read as a delay-induced one.
-    fn regression(&self, before: &Self, after: &Self) -> f64 {
+    fn regression(&self, before: &Self, after: &Self) -> Self::Drop {
         let drop = |baseline: &Self| {
             // A baseline of zero fps has nothing to be a fraction of.
             if self.fps.is_nan() || baseline.fps.is_nan() || baseline.fps <= 0.0 {
@@ -209,6 +237,10 @@ impl Metric for GameFps {
             }
             (baseline.fps - self.fps) / baseline.fps * 100.0
         };
-        drop(before).min(drop(after))
+        GameDrop { fps_percent: drop(before).min(drop(after)) }
+    }
+
+    fn is_bad(total: &Self::Drop) -> bool {
+        total.fps_percent >= DROP_SUM_THRESHOLD
     }
 }
