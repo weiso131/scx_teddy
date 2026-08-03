@@ -118,6 +118,68 @@ sudo ./target/release/scx_teddy -m classify -c 1 --model model.json --config con
   + 策略（選用，見下）
 - `--control-interval <SECONDS>` — 多久重讀一次 control 檔（預設：5）
 
+## 量出策略該長什麼樣：`expt_tolerance`
+
+手寫策略等於用猜的決定哪些 cluster 真的需要低延遲。`expt_tolerance` 改成用量的：
+一次對一個 cluster 注入排程延遲，看遊戲會不會變差，再由結果推導優先權。
+
+用 model JSON 的 `algorithm` 欄位選擇——模型本身就是一般的 K-means 模型，照上面
+訓練完改這一個欄位即可（`train.py` 一律寫 `kmeans`）：
+
+```json
+{
+  "algorithm": "expt_tolerance",
+  "n_clusters": 10,
+  ...
+}
+```
+
+搜尋以 cluster 為單位，在 30 秒 warm-up 之後開始：
+
+1. 先量一次沒注入延遲的遊戲表現，對該 cluster 的所有任務注入 `expt_wait`，再量一
+   次，然後移除延遲再量第三次。**前後各量一次**沒注入的狀態，才不會把遊戲自己的
+   起伏當成延遲造成的。
+2. 重複數輪，把每輪的降幅**累加**。累積降幅超過門檻就判定這個延遲是壞的——累加而
+   非計算壞掉的輪數，才能讓「一次腰斬」與「連續多次小掉」都達成判定。
+3. 延遲可容忍就加倍再試；不能容忍就結束這個 cluster，容忍度取最後一個通過的延遲。
+
+接著依實測容忍度排序——最不能忍的拿 `prio 0`——並把結果寫成一份新的 config 供你
+檢視。**輸入的 config 絕不會被修改**：校準結果是提案，不會在你不知情下直接套用。
+用 `calibrated_output` 指定輸出位置，沒指定就不會寫出：
+
+```json
+{
+  "clusters": { "0": { "prio": 4, "slice_ns": 100000 } },
+  "default":  { "prio": 4, "slice_ns": 100000 },
+  "calibrated_output": "/path/to/config_calibrated.json"
+}
+```
+
+這個路徑在啟動時也會印出來，忘了改的 config 當場就看得到，不必等跑上好幾個小時
+之後才發現。
+
+### 用什麼衡量遊戲
+
+同一個窗口內的兩個訊號，**任一個崩掉就算失敗**——畫面卡頓與聲音斷裂各自都不可接
+受，分開計分才不會被另一個撐住而平均掉：
+
+| 訊號 | 來源 | 需要 |
+|---|---|---|
+| 幀率 | Vulkan layer 攔截 `vkQueuePresentKHR`，走 POSIX 共享記憶體 | 安裝該 layer |
+| 音訊速率 | `pa_stream_write` uprobe，走 BPF map | 遊戲使用 PulseAudio |
+
+Vulkan layer **不在**本 repo 內，它在
+[`latency_creater`](https://github.com/weiso131/latency_creater) 專案的
+`game_fps/` 目錄下。沒有它就讀不到幀率，實驗無法進行。音訊那側不需要額外安裝，
+遊戲靜音時該項單純計 0，交由幀率判定。
+
+⚠️ 這個模式**會刻意讓遊戲卡頓**：注入延遲正是它找出極限的手段。跑它是為了校準策
+略，校準完請改用它產生的 config 正常執行。
+
+⚠️ 目前這個模式**還沒完整跟 GUI 結合**——GUI 會用自己的編輯器內容重建 config，不
+會把 `calibrated_output` 帶過去，校準結果會落在會被清掉的位置。在補上之前，
+**建議直接用命令列跑 `expt_tolerance`**。
+
 ## 特化：優化單一 process 家族
 
 scx_teddy 可以給某個 process 與其所有後代一套自己的排程，跟系統其餘任務區隔開 ——

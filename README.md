@@ -129,6 +129,79 @@ sudo ./target/release/scx_teddy -m classify -c 1 --model model.json --config con
 - `--control-interval <SECONDS>` — how often to re-read the control files
   (default: 5)
 
+## Measuring what a policy should be: `expt_tolerance`
+
+Writing a policy by hand means guessing which clusters actually need low latency.
+`expt_tolerance` measures it instead: it injects a scheduling delay into one
+cluster at a time, watches whether the game degrades, and derives the priorities
+from what it found.
+
+Select it by setting `algorithm` in the model JSON — the model itself is an
+ordinary K-means model, so train it exactly as above and edit the one field
+(`train.py` always writes `kmeans`):
+
+```json
+{
+  "algorithm": "expt_tolerance",
+  "n_clusters": 10,
+  ...
+}
+```
+
+The search runs per cluster, after a 30-second warm-up:
+
+1. Measure the game undelayed, inject `expt_wait` into every task of the cluster,
+   measure again, remove it, and measure a third time. The undelayed state is
+   measured on **both** sides so the game's own fluctuation is not read as an
+   effect of the delay.
+2. Repeat for several rounds and sum how much each round cost. A delay counts as
+   bad once the total crosses a threshold — summing rather than counting bad
+   rounds lets one ruinous round and a run of mild ones both reach a verdict.
+3. If the delay was tolerable, double it and go again; otherwise this cluster is
+   done and its tolerance is the largest delay that survived.
+
+Clusters are then ranked by measured tolerance — least tolerant gets `prio 0` —
+and the result is written as a new config for you to inspect. **The input config
+is never modified**: the calibration is a proposal, not something applied behind
+your back. Name the destination with `calibrated_output`, or nothing is written:
+
+```json
+{
+  "clusters": { "0": { "prio": 4, "slice_ns": 100000 } },
+  "default":  { "prio": 4, "slice_ns": 100000 },
+  "calibrated_output": "/path/to/config_calibrated.json"
+}
+```
+
+It is printed at startup too, so a config you forgot to edit shows up
+immediately rather than after a run that takes hours.
+
+### What it measures the game with
+
+Two signals over one shared window, either of which counts as a failure on its
+own — stuttering video and broken audio are each unacceptable, and scoring them
+apart keeps one from being averaged away by the other holding up:
+
+| signal | source | needs |
+|---|---|---|
+| framerate | `vkQueuePresentKHR` in a Vulkan layer, over POSIX shared memory | the layer installed |
+| audio rate | `pa_stream_write` uprobe, over a BPF map | the game to use PulseAudio |
+
+The Vulkan layer is **not** part of this repository — it lives in the
+[`latency_creater`](https://github.com/weiso131/latency_creater) project, under
+its `game_fps/` directory. Without it there is no framerate to read and the
+experiment cannot run. The audio side needs nothing extra, and a silent game
+simply scores 0 there, leaving the framerate to decide.
+
+⚠️ This mode **deliberately makes the game stutter** while it searches: injecting
+delay is how it finds the limit. Run it to calibrate a policy, then run normally
+with the config it produced.
+
+⚠️ The GUI does not fully support this mode yet — it rebuilds the config from its
+own editor and does not carry `calibrated_output` through, so the calibration
+ends up somewhere disposable. **Run `expt_tolerance` from the command line** until
+that is wired up.
+
 ## Specialization: optimizing one process family
 
 scx_teddy can give one process and all its descendants their own scheduling,
