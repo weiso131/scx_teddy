@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -296,7 +296,6 @@ fn experiment_loop(
     map: MapHandle,
     delay_map: MapHandle,
     config: SchedConfig,
-    config_path: String,
 ) {
     eprintln!("[expt] experiment thread started");
     loop {
@@ -306,7 +305,7 @@ fn experiment_loop(
                 eprintln!("[expt] all clusters done, calibrating");
                 // finish_calibration takes the lock itself.
                 drop(st);
-                finish_calibration(&state, &config, &config_path);
+                finish_calibration(&state, &config);
                 return;
             };
             let params = st.cur_params_for(cluster);
@@ -456,23 +455,26 @@ fn calibrated_config(base: &SchedConfig, clusters: &[ClusterExpt]) -> SchedConfi
     out
 }
 
-/// Write `config` next to `base_path` as `<stem>_calibrated.json`. Returns the
-/// path written. The original is never modified: the calibration is a proposal
-/// to inspect, not something to apply behind the user's back.
-fn write_calibrated_config(base_path: &str, config: &SchedConfig) -> Result<PathBuf> {
-    let base = Path::new(base_path);
-    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("config");
-    let out_path = base.with_file_name(format!("{stem}_calibrated.json"));
+/// Write `config` to its `calibrated_output`. The input file is never modified:
+/// the calibration is a proposal to inspect, not something to apply behind the
+/// user's back.
+fn write_calibrated_config(out_path: &str, config: &SchedConfig) -> Result<()> {
+    let out_path = Path::new(out_path);
+    // The destination is an arbitrary path from the config, so its directory may
+    // not exist yet.
+    if let Some(dir) = out_path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
+    }
     let json = serde_json::to_string_pretty(config)
         .context("Failed to serialize the calibrated config")?;
-    std::fs::write(&out_path, json)
-        .with_context(|| format!("Failed to write calibrated config: {}", out_path.display()))?;
-    Ok(out_path)
+    std::fs::write(out_path, json)
+        .with_context(|| format!("Failed to write calibrated config: {}", out_path.display()))
 }
 
 /// Report the measured tolerances and emit the calibrated config. Called once,
 /// when every cluster's search has finished.
-fn finish_calibration(state: &Arc<Mutex<ExptState>>, config: &SchedConfig, config_path: &str) {
+fn finish_calibration(state: &Arc<Mutex<ExptState>>, config: &SchedConfig) {
     let st = state.lock().unwrap();
 
     for (rank, group) in tolerance_groups(&st.clusters).iter().enumerate() {
@@ -490,8 +492,12 @@ fn finish_calibration(state: &Arc<Mutex<ExptState>>, config: &SchedConfig, confi
         }
     }
 
-    match write_calibrated_config(config_path, &calibrated_config(config, &st.clusters)) {
-        Ok(path) => eprintln!("[expt] calibrated config written to {}", path.display()),
+    let Some(out_path) = config.calibrated_output.as_deref() else {
+        eprintln!("[expt] no calibrated_output in the config, nothing written");
+        return;
+    };
+    match write_calibrated_config(out_path, &calibrated_config(config, &st.clusters)) {
+        Ok(()) => eprintln!("[expt] calibrated config written to {out_path}"),
         Err(e) => eprintln!("[expt] failed to write calibrated config: {e:#}"),
     }
 }
@@ -527,9 +533,6 @@ pub struct ExptTolerancePredictor {
     /// Maps a cluster to its scheduling parameters. An unknown cluster falls
     /// back to the config's `default` entry.
     config: SchedConfig,
-    /// Where `config` was loaded from; the calibrated config is written beside
-    /// it when the experiment finishes.
-    config_path: String,
     /// When this predictor was created, for measuring the warm-up.
     start: Instant,
     /// Set once the experiment thread has been spawned, so it happens only once.
@@ -554,6 +557,16 @@ impl ExptTolerancePredictor {
         )?;
         let config = SchedConfig::from_path(config_path)?;
 
+        // Report the destination now rather than only when the calibration lands
+        // there: the run in between takes hours, which is far too late to find
+        // out the config was not the one that got edited.
+        match &config.calibrated_output {
+            Some(p) => eprintln!("[expt] calibrated config will be written to {p}"),
+            None => eprintln!(
+                "[expt] no calibrated_output in {config_path}, the calibration will not be written"
+            ),
+        }
+
         // Snapshot each cluster's params for the experiment thread (config lives
         // on the classify thread). An unknown cluster falls back to `default`.
         let cluster_params: Vec<ExptParams> = (0..model.n_clusters)
@@ -564,7 +577,6 @@ impl ExptTolerancePredictor {
             n_clusters: model.n_clusters,
             core,
             config,
-            config_path: config_path.to_string(),
             start: Instant::now(),
             spawned: AtomicBool::new(false),
             state: Arc::new(Mutex::new(ExptState::new(cluster_params))),
@@ -595,10 +607,9 @@ impl ExptTolerancePredictor {
         // The thread outlives this borrow, so it gets its own copy of the config
         // to build the calibrated one from.
         let config = self.config.clone();
-        let config_path = self.config_path.clone();
         eprintln!("[expt] warm-up done, spawning experiment thread");
         std::thread::spawn(move || {
-            experiment_loop(state, map, delay_map, config, config_path)
+            experiment_loop(state, map, delay_map, config)
         });
         Ok(())
     }

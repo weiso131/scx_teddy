@@ -80,6 +80,14 @@ pub struct ClusterSchedConfig {
 pub struct SchedConfig {
     pub clusters: HashMap<String, ClusterSchedConfig>,
     pub default: ClusterSchedConfig,
+    /// Where `expt_tolerance` writes the config it calibrates. Only that
+    /// predictor reads this, so every other mode may leave it out.
+    ///
+    /// It exists because the calibrated config used to land beside the input,
+    /// and the input is usually somewhere disposable (the GUI hands out /tmp
+    /// paths) — the result would be written somewhere the user does not keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibrated_output: Option<String>,
 }
 
 impl SchedConfig {
@@ -94,7 +102,7 @@ impl SchedConfig {
         let content = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config: {}", config_path))?;
         serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse config: {}", config_path))
+            .with_context(|| format!("Failed to parse config: {}", content))
     }
 
     /// Reject any cluster (or the default) whose `cpu_kind` exceeds the machine's
