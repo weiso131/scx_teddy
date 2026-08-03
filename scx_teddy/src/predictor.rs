@@ -71,12 +71,14 @@ pub trait Predictor: Send + Sync {
         update_map: &libbpf_rs::Map,
     ) -> Result<Option<SchedDecision>>;
 
-    /// Hand the predictor the BPF per-tid delay-EWMA map (tid -> ns) once the
-    /// skeleton is loaded. Called once per set right after load, and again for a
-    /// target set reloaded live. Most predictors don't need it (default no-op);
-    /// `expt_tolerance` clones it into an owned handle so its experiment thread
-    /// can read tasks' real scheduling delay off the ringbuf path.
-    fn attach_sched_delay_map(&self, _map: &libbpf_rs::Map) {}
+    /// Hand the predictor the BPF maps its own threads read directly, once the
+    /// skeleton is loaded: the per-tid delay-EWMA map (tid -> ns) and the audio
+    /// measurement window. Called once per set right after load, and again for a
+    /// target set reloaded live. Most predictors don't need them (default no-op);
+    /// `expt_tolerance` clones them into owned handles so its experiment thread
+    /// can read a task's real scheduling delay off the ringbuf path and measure
+    /// audio throughput over its windows.
+    fn attach_expt_maps(&self, _sched_delay: &libbpf_rs::Map, _audio_expt: &libbpf_rs::Map) {}
 
     /// Number of output categories (clusters or classes).
     fn n_outputs(&self) -> usize;

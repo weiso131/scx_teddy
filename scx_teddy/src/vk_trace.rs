@@ -6,7 +6,7 @@
 //! A separate shm object from the fps buffer, and read differently: there is no
 //! handshake. Every field is atomic and the layer maintains the tables on every
 //! call, so a reader takes a snapshot whenever it likes and never blocks. The
-//! fps path (`metrics/game_fps.rs`) is the one with the request/response
+//! fps path (`metrics/game_latency.rs`) is the one with the request/response
 //! protocol; the two share nothing but the layer that writes them.
 //!
 //! We only ever read, and we never create the object: its absence just means no

@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use crate::predictor::{Predictor, SchedDecision, write_sched_info};
 use crate::predictors::helper::{self, ClusterSchedConfig, KMeansCore, SchedConfig};
 use crate::predictors::expt_tolerance::metric::Metric;
-use crate::predictors::expt_tolerance::metrics::game_fps::GameFps;
+use crate::predictors::expt_tolerance::metrics::game_latency::{self, GameLatency};
 use crate::task_stats::TaskStats;
 
 /// Warm-up before the experiment starts: classify without touching `expt_wait`
@@ -276,11 +276,11 @@ fn measure_window(
     epoch: u64,
     phase: &str,
     cluster: usize,
-) -> (GameFps, Option<u64>) {
+) -> (GameLatency, Option<u64>) {
     loop {
         // `measure` only errors while first mapping the shm; once that succeeds
         // it always returns `Ok`
-        let sample = GameFps::measure(*measure_sec)
+        let sample = GameLatency::measure(*measure_sec)
             .unwrap_or_else(|e| panic!("measure ({phase}) failed after warm-up: {e}"));
         let delay = cluster_mean_delay(state, delay_map, epoch);
         if delay.is_some() || *measure_sec >= MEASURE_SEC_MAX {
@@ -331,7 +331,7 @@ fn experiment_loop(
         // round would re-pay the same lengthening.
         let mut measure_sec = MEASURE_SEC_START;
         for _ in 0..MAX_WAIT_MULTIPLE {
-            let mut drop_sum = <GameFps as Metric>::Drop::default();
+            let mut drop_sum = <GameLatency as Metric>::Drop::default();
             // Largest delay actually measured across this value's rounds.
             let mut max_real_delay = 0u64;
             for _ in 0..EXPT_ROUNDS {
@@ -369,7 +369,7 @@ fn experiment_loop(
 
             // A bad value ends the search: good_expt_wait already holds the last
             // OK value. Otherwise record this value as good and double it.
-            if GameFps::is_bad(&drop_sum) {
+            if GameLatency::is_bad(&drop_sum) {
                 eprintln!(
                     "[expt] cluster {cluster}: expt_wait={expt_wait} bad \
                      (drop_sum={drop_sum}) -> done"
@@ -537,7 +537,7 @@ pub struct ExptTolerancePredictor {
     /// Shared with the experiment thread (see `ExptState`).
     state: Arc<Mutex<ExptState>>,
     /// Owned handle to the BPF per-tid delay-EWMA map, set by
-    /// `attach_sched_delay_map` after the skeleton loads and handed to the
+    /// `attach_expt_maps` after the skeleton loads and handed to the
     /// experiment thread when it spawns. `None` until then.
     sched_delay_map: Mutex<Option<MapHandle>>,
 }
@@ -587,7 +587,7 @@ impl ExptTolerancePredictor {
         let map = MapHandle::try_from(update_map)
             .context("Failed to clone update_map for the experiment thread")?;
         // Take the delay-map handle attached after load. It must be present by
-        // now: attach_sched_delay_map runs right after the skeleton loads, long
+        // now: attach_expt_maps runs right after the skeleton loads, long
         // before the warm-up that gates this spawn elapses.
         let delay_map = self.sched_delay_map.lock().unwrap().take()
             .context("sched_delay_map was never attached before the experiment spawned")?;
@@ -676,12 +676,20 @@ impl Predictor for ExptTolerancePredictor {
         Ok(Some(decision))
     }
 
-    fn attach_sched_delay_map(&self, map: &libbpf_rs::Map) {
-        match MapHandle::try_from(map) {
+    fn attach_expt_maps(&self, sched_delay: &libbpf_rs::Map, audio_expt: &libbpf_rs::Map) {
+        match MapHandle::try_from(sched_delay) {
             Ok(handle) => *self.sched_delay_map.lock().unwrap() = Some(handle),
             // Only logged: the experiment thread's take() will surface a hard
             // error if it spawns without a handle, so a failure here isn't silent.
             Err(e) => eprintln!("[expt] failed to clone sched_delay_map: {e}"),
+        }
+        // Goes straight to the metric rather than being held for the experiment
+        // thread: `measure` is a stateless associated function, so the map has to
+        // reach it process-wide. A failure here costs the audio half of the
+        // metric and nothing else, so it is only logged.
+        match MapHandle::try_from(audio_expt) {
+            Ok(handle) => game_latency::attach_audio_map(handle),
+            Err(e) => eprintln!("[expt] failed to clone audio_expt_map: {e}; fps only"),
         }
     }
 

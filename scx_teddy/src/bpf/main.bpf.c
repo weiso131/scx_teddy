@@ -161,6 +161,17 @@ struct {
     __type(value, sched_delay_t);
 } sched_delay_map SEC(".maps");
 
+/* Single-entry window the experiment loop measures audio throughput over; see
+ * audio_expt_t in intf.h for the handshake. One entry, not one per task: this
+ * counts what the whole workload fed the audio pipeline, the counterpart of the
+ * layer's frame count. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, audio_expt_t);
+} audio_expt_map SEC(".maps");
+
 static __always_inline void publish_sched_delay(struct task_struct *p,
                                                 target_ctx_t *target_ctx)
 {
@@ -723,6 +734,19 @@ long BPF_KPROBE(trace_ntsync_char_ioctl, struct file *file,
 SEC("uprobe")
 int BPF_UPROBE(trace_pa_stream_write)
 {
+    /* Ahead of the target_ctx lookup: the experiment measures what the workload
+     * as a whole feeds the audio pipeline, including threads with no storage. */
+    u32 expt_key = 0;
+    audio_expt_t *expt = bpf_map_lookup_elem(&audio_expt_map, &expt_key);
+    if (expt) {
+        if (expt->state == AUDIO_EXPT_RUN)
+            expt->count++;
+        else if (expt->state == AUDIO_EXPT_STOP)
+            /* Answering the close is what hands the count to userspace, so it
+             * must be the last write the probe makes to this window. */
+            expt->state = AUDIO_EXPT_IDLE;
+    }
+
     struct task_struct *p = bpf_get_current_task_btf();
     target_ctx_t *target_ctx = get_target_storage(p);
     if (!target_ctx)

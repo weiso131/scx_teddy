@@ -75,6 +75,29 @@ typedef struct sched_delay {
     u64 epoch;  // the epoch in force when the EWMA last took a sample
 } sched_delay_t;
 
+/* Audio-throughput measurement window, driven by userspace over
+ * audio_expt_map. Distinct from target_ctx's audio_rate_max: that is a per-task
+ * classification feature (peak demand, never reset), this is a workload-wide
+ * count of writes over one experiment window.
+ *
+ * `state` carries the whole handshake. Userspace stores RUN to open a window,
+ * then STOP to close it; the probe sees STOP on its next call and answers IDLE,
+ * which tells userspace no probe will touch `count` again and it may read it.
+ * Having the probe rather than userspace write IDLE is what makes the count
+ * settled at that point — the probe cannot be mid-increment.
+ *
+ * The probe may never run again (silence, or an audio thread starved by the
+ * injected delay), so userspace also gives up after a timeout and takes the
+ * count as it stands; only the window's end boundary is fuzzy then. */
+#define AUDIO_EXPT_IDLE 0  // no window open; count is settled and readable
+#define AUDIO_EXPT_RUN  1  // window open, probe counting
+#define AUDIO_EXPT_STOP 2  // close requested; probe acknowledges by storing IDLE
+
+typedef struct audio_expt {
+    u32 state;
+    u32 count;  // pa_stream_write calls counted in the current window
+} audio_expt_t;
+
 typedef struct task_info {
     s32 prio;
     u8 kind;  // DSQ slot: 0 = shared (any kind), 1..cpu_kind_num = kind-only
