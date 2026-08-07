@@ -520,21 +520,9 @@ s32 BPF_STRUCT_OPS(teddy_init_task, struct task_struct *p,
     return 0;
 }
 
-void BPF_STRUCT_OPS(teddy_runnable, struct task_struct *p, u64 enq_flags)
+static __always_inline void apply_pending_update(struct task_struct *p,
+                                                 target_ctx_t *target_ctx)
 {
-    target_ctx_t *target_ctx = get_target_storage(p);
-    if (!target_ctx)
-        return;
-    u64 now = scx_bpf_now();
-    /* Scheduling delay starts counting the moment the task becomes runnable. */
-    target_ctx->wait_start = now;
-    if (enq_flags & SCX_ENQ_WAKEUP)
-        target_ctx->sleep_end = now;
-
-    /* Applied on the way in rather than on the way out: everything below is read
-     * by `select_cpu`/`enqueue`, which run right after this, so a write takes
-     * effect on the very next dispatch. A task that runs rarely would otherwise
-     * have to run once more before its new settings meant anything. */
     s32 key = p->pid;
     sched_info_t *update_info = bpf_map_lookup_elem(&update_map, &key);
     if (unlikely(update_info && update_info->prio != PRIO_CONSUMED)) {
@@ -561,6 +549,20 @@ void BPF_STRUCT_OPS(teddy_runnable, struct task_struct *p, u64 enq_flags)
          * value, not a copy. */
         update_info->prio = PRIO_CONSUMED;
     }
+}
+
+void BPF_STRUCT_OPS(teddy_runnable, struct task_struct *p, u64 enq_flags)
+{
+    target_ctx_t *target_ctx = get_target_storage(p);
+    if (!target_ctx)
+        return;
+    u64 now = scx_bpf_now();
+    /* Scheduling delay starts counting the moment the task becomes runnable. */
+    target_ctx->wait_start = now;
+    if (enq_flags & SCX_ENQ_WAKEUP)
+        target_ctx->sleep_end = now;
+
+    apply_pending_update(p, target_ctx);
 }
 
 void BPF_STRUCT_OPS(teddy_running, struct task_struct *p)
@@ -632,6 +634,9 @@ void BPF_STRUCT_OPS(teddy_stopping, struct task_struct *p, bool runnable)
         if (target_ctx->runtime_ns >= RUNTIME_MAX_TIME) {
             update_event_data(target_ctx);
             try_data_to_user(p, target_ctx);
+            /* A task that never sleeps never goes through `runnable`, so this is
+             * the only place its settings can reach it */
+            apply_pending_update(p, target_ctx);
         }
     }
 }
